@@ -232,11 +232,118 @@ Units to trade = (target_allocation - current_value) / current_price
 
 **Risk assessment**: Low/Medium/High based on action (Buy/Hold/Sell) and position change magnitude
 
-### 2. Portfolio advisor (`scripts/portfolio_advisor.py`)
+## Scheduled Batch Analysis & Order Management
 
-Not built yet. The `TraderProposal` schema has `position_sizing` (e.g. "5% of portfolio") and `entry_price`, but the framework has no awareness of actual holdings or cash.
+### Setup Wizard (`scripts/create_profile.py`)
 
-Planned inputs: current cash budget + holdings dict `{"NVDA": 10, "AAPL": 5}`.
-Planned output: specific buy/sell unit counts derived from rating + position sizing % × total portfolio value ÷ current price.
+Interactive first-run wizard. Creates `~/.tradingagents/profile.json` (LLM settings) and
+`~/.tradingagents/portfolio_config.json` (tickers, cash budget, holdings).
 
-`PortfolioDecision` and `TraderProposal` are the output schemas to read from — both in `tradingagents/agents/schemas.py`.
+```bash
+python scripts/create_profile.py
+```
+
+Prompts for: cash budget, tickers, existing holdings per ticker, LLM provider + models, max parallel workers.
+
+**Persistent files**:
+- `~/.tradingagents/profile.json` — LLM provider, model names, max_workers
+- `~/.tradingagents/portfolio_config.json` — tickers list, budget, holdings dict (`{"NVDA": 10}`)
+
+### Market Pre-Screener (`scripts/pre_screener.py`)
+
+Filters the full US equity universe down to top-N candidates using pure technical signals — no LLM cost. Run before nightly analysis to avoid analysing thousands of tickers manually.
+
+**Two-stage pipeline**:
+1. **Universe** — Downloads ticker list from NASDAQ FTP (~9,000 stocks) or a curated index. Cached 24 h.
+2. **Liquidity filter** — 5-day yfinance batch download; drops price < $5 and avg volume < 500k.
+3. **Signal computation** — 65-day download; computes RSI-14, 20d/5d/1d momentum, volume spike vs 20d avg, 50/200 MA trend.
+4. **Ranking** — Weighted composite score (momentum 35%, volume 25%, RSI health 20%, trend 20%).
+
+```bash
+python scripts/pre_screener.py                            # full US market (NASDAQ FTP, home PC)
+python scripts/pre_screener.py --universe sp500           # S&P 500 only (~500 stocks)
+python scripts/pre_screener.py --universe sp500+nasdaq100 # union of both indices
+python scripts/pre_screener.py --top 30                   # widen to 30 candidates (default 20)
+python scripts/pre_screener.py --dry-run                  # show plan, skip downloads
+python scripts/pre_screener.py --run-analysis             # screen then immediately run nightly analysis
+```
+
+**Universe options**: `full` (NASDAQ FTP, requires open internet), `sp500`, `nasdaq100`, `sp500+nasdaq100`.
+Use `sp500` or `sp500+nasdaq100` when NASDAQ FTP is blocked (e.g. GitHub Codespaces).
+
+**Output**: `reports/SCREENER_{date}.json` with ranked tickers — feeds directly into nightly analysis via `--ticker-file`.
+
+**Cron (3:45 PM ET, before nightly analysis at 3:55)**:
+```
+45 15 * * 1-5  cd /path/to/TradingAgents && python scripts/pre_screener.py --run-analysis
+```
+
+### Nightly Analysis Runner (`scripts/nightly_analysis.py`)
+
+Reads `~/.tradingagents/profile.json` and `~/.tradingagents/portfolio_config.json`, runs `PortfolioAdvisor`, and writes staged orders to `~/.tradingagents/orders/ORDERS_{date}.json` with `status: pending`. User reviews orders before submitting to their broker.
+
+```bash
+python scripts/nightly_analysis.py                          # today's date, tickers from portfolio_config
+python scripts/nightly_analysis.py --date 2026-06-02
+python scripts/nightly_analysis.py --dry-run                # print plan, skip LLM calls
+python scripts/nightly_analysis.py --ticker-file reports/SCREENER_2026-06-02.json  # from pre-screener
+```
+
+**`--ticker-file`** accepts a screener JSON (key `tickers`) or a plain text file (one ticker per line).
+
+**Order file format** (`~/.tradingagents/orders/ORDERS_{date}.json`):
+```json
+{
+  "date": "2026-06-02",
+  "generated_at": "...",
+  "orders": [
+    {
+      "id": "uuid",
+      "ticker": "NVDA",
+      "action": "Buy",
+      "direction": "buy",
+      "units": 5.0,
+      "estimated_price": 224.87,
+      "estimated_total": 1124.35,
+      "order_type": "market",
+      "status": "pending",
+      "executed_at": null,
+      "executed_price": null,
+      "executed_units": null
+    }
+  ]
+}
+```
+
+**Cron (3:55 PM ET Mon-Fri)**:
+```
+55 15 * * 1-5  cd /path/to/TradingAgents && python scripts/nightly_analysis.py
+```
+
+### Holdings Updater (`scripts/update_holdings.py`)
+
+After your broker executes (or skips) staged orders, run this to record actual fills. For each pending order it asks: executed? at what price? how many units? Updates `portfolio_config.json` and appends to `~/.tradingagents/transactions.jsonl`.
+
+```bash
+python scripts/update_holdings.py           # interactive — pick order file
+python scripts/update_holdings.py --list    # list all order files and pending counts
+python scripts/update_holdings.py --file ORDERS_2026-06-02.json
+```
+
+**Order lifecycle**: `pending` → broker fills → run `update_holdings.py` → `executed` or `cancelled`
+
+**Files written**:
+- `~/.tradingagents/portfolio_config.json` — holdings and budget updated in place
+- `~/.tradingagents/transactions.jsonl` — append-only audit log (one JSON record per trade)
+
+### End-to-end daily workflow
+
+```
+3:45 PM  python scripts/pre_screener.py --universe sp500 --run-analysis
+           └─ screens S&P 500 → top 20 candidates → runs nightly analysis automatically
+3:55 PM  (or manually) python scripts/nightly_analysis.py --ticker-file reports/SCREENER_*.json
+           └─ LLM analysis → staged orders in ~/.tradingagents/orders/
+next day  review orders → submit to broker
+after fill  python scripts/update_holdings.py
+           └─ record actual fills → portfolio_config.json updated
+```
