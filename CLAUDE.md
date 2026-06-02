@@ -143,22 +143,94 @@ Non-US tickers use suffix conventions: `.NS` (India NSE), `.T` (Tokyo), `.HK` (H
 
 Tests are under `tests/` with markers `unit`, `integration`, `smoke`. Notable test files: `test_env_overrides.py`, `test_checkpoint_resume.py`, `test_memory_log.py`, `test_structured_agents.py`, `test_instrument_identity.py`. Most tests mock LLM calls and data fetches so no API keys are required.
 
-## Planned features (not yet built)
+## Batch Analysis & Portfolio Optimization
 
-### 1. Watchlist scanner (`scripts/scan_watchlist.py`)
+### Watchlist Scanner (`scripts/scan_watchlist.py`)
 
-The framework analyzes one ticker at a time. A wrapper that loops over a watchlist and produces a ranked summary table is planned but not yet implemented. Skeleton:
+Analyzes multiple tickers in parallel (up to 5 concurrent) and produces ranked summary tables.
 
-```python
-from tradingagents.graph.trading_graph import TradingAgentsGraph
-from tradingagents.default_config import DEFAULT_CONFIG
-
-ta = TradingAgentsGraph(config={**DEFAULT_CONFIG, "llm_provider": "ollama", ...})
-watchlist = ["NVDA", "AAPL", "MSFT"]
-results = {ticker: ta.propagate(ticker, date) for ticker in watchlist}
+**Usage**:
+```bash
+python scripts/scan_watchlist.py "NVDA,AAPL,MSFT,TSLA" "2026-06-02" 5
 ```
 
-Each ticker takes ~10 minutes and ~500k tokens. On free-tier Gemini, scanning more than 2–3 tickers will likely hit daily quota. Use Ollama locally for unrestricted batch runs.
+**Parameters**:
+- `tickers`: Comma-separated list (e.g., `"NVDA,AAPL,MSFT"`)
+- `date`: Analysis date in YYYY-MM-DD format
+- `max_workers`: Max parallel workers (default 5, optional)
+
+**Output**:
+- JSON summary with status, success count, failed tickers
+- CSV: `reports/WATCHLIST_{date}.csv` (sortable by rating, ticker, etc.)
+- Markdown: `reports/WATCHLIST_{date}.md` (human-readable summary table)
+- Individual reports: `reports/{TICKER}_{timestamp}/` (one per ticker, existing behavior)
+
+**Example output**:
+```
+{
+  "success": true,
+  "tickers_scanned": 4,
+  "tickers_succeeded": 4,
+  "tickers_failed": 0,
+  "elapsed_seconds": 45.3,
+  "summary_csv": "reports/WATCHLIST_2026-06-02.csv",
+  "summary_md": "reports/WATCHLIST_2026-06-02.md"
+}
+```
+
+**Performance**: Each ticker ~10 min (Gemini 2.5 Flash). 5 tickers in parallel: ~12–15 min wall clock vs. ~50 min sequential. On free-tier Gemini, scanning more than 2–3 tickers will likely hit daily quota. Use Ollama locally for unrestricted batch runs.
+
+### Portfolio Advisor (`scripts/portfolio_advisor.py`)
+
+Converts watchlist analysis into specific buy/sell unit counts and rebalancing recommendations based on your current holdings and budget.
+
+**Usage**:
+```bash
+# Create portfolio_config.json with your holdings
+python scripts/portfolio_advisor.py portfolio_config.json
+```
+
+**Config file format**:
+```json
+{
+  "tickers": ["NVDA", "AAPL", "MSFT"],
+  "date": "2026-06-02",
+  "budget": 10000,
+  "holdings": {
+    "NVDA": 10,
+    "AAPL": 5
+  },
+  "max_workers": 5
+}
+```
+
+**What it does**:
+1. Runs `WatchlistScanner` internally to analyze your tickers
+2. Fetches current market prices
+3. Calculates rebalancing needed based on position sizing % from analysis
+4. Outputs specific units to buy/sell per ticker
+
+**Key calculation**:
+```
+Target allocation = position_sizing_% × total_portfolio_value
+Current value = current_units × current_price
+Units to trade = (target_allocation - current_value) / current_price
+```
+
+**Outputs**:
+- JSON: Full recommendations with units, prices, risk levels
+- CSV: `reports/ADVISOR_{date}.csv` (sortable by ticker, action, risk)
+- Markdown: `reports/ADVISOR_{date}.md` (human-readable summary table)
+
+**Example output columns**:
+- Ticker | Action | Rating | Current Price | Units Held | Units to Trade | $ Amount | Current % | Target % | Risk
+
+**Position sizing parsing**:
+- Extracts percentages from text (e.g., "5% of portfolio" → 0.05)
+- Handles ranges (e.g., "3-5%" → uses midpoint)
+- Falls back to 3% if unparseable
+
+**Risk assessment**: Low/Medium/High based on action (Buy/Hold/Sell) and position change magnitude
 
 ### 2. Portfolio advisor (`scripts/portfolio_advisor.py`)
 
