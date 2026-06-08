@@ -71,11 +71,23 @@ def _build_config(profile: dict) -> dict:
     return config
 
 
-def _recommendations_to_orders(recommendations: list[dict], date: str) -> dict:
+def _calc_limit_price(estimated_price: float, direction: str, buffer_pct: float) -> float:
+    """Buy limit: slightly above estimated to ensure fill. Sell limit: slightly below."""
+    if direction == "buy":
+        return round(estimated_price * (1 + buffer_pct / 100), 4)
+    return round(estimated_price * (1 - buffer_pct / 100), 4)
+
+
+def _recommendations_to_orders(
+    recommendations: list[dict], date: str, buffer_pct: float = 0.5
+) -> dict:
     orders = []
     for rec in recommendations:
         if rec.get("units_to_trade", 0) == 0:
             continue
+        direction = "buy" if rec["units_to_trade"] > 0 else "sell"
+        estimated_price = rec["current_price"]
+        limit_price = _calc_limit_price(estimated_price, direction, buffer_pct)
         orders.append(
             {
                 "id": str(uuid.uuid4()),
@@ -83,10 +95,12 @@ def _recommendations_to_orders(recommendations: list[dict], date: str) -> dict:
                 "action": rec["action"],
                 "rating": rec.get("rating", ""),
                 "units": abs(rec["units_to_trade"]),
-                "direction": "buy" if rec["units_to_trade"] > 0 else "sell",
-                "estimated_price": rec["current_price"],
-                "estimated_total": rec["dollar_amount"],
-                "order_type": "market",
+                "direction": direction,
+                "estimated_price": estimated_price,
+                "limit_price": limit_price,
+                "limit_price_buffer_pct": buffer_pct,
+                "estimated_total": round(limit_price * abs(rec["units_to_trade"]), 2),
+                "order_type": "limit",
                 "status": "pending",
                 "created_at": datetime.now().isoformat(),
                 "executed_at": None,
@@ -125,8 +139,8 @@ def _print_orders_table(orders: list[dict]):
     t.add_column("Rating", width=12)
     t.add_column("Units", justify="right", width=7)
     t.add_column("Est. Price", justify="right", width=10)
+    t.add_column("Limit Price", justify="right", width=11)
     t.add_column("Est. Total", justify="right", width=11)
-    t.add_column("Order Type", width=10)
     t.add_column("Status", width=8)
 
     for order in sorted(orders, key=lambda o: o["ticker"]):
@@ -137,8 +151,8 @@ def _print_orders_table(orders: list[dict]):
             order.get("rating", ""),
             f"{order['units']:.2f}",
             f"${order['estimated_price']:,.2f}",
+            f"[bold]${order['limit_price']:,.4f}[/bold]",
             f"${order['estimated_total']:,.2f}",
-            order["order_type"],
             f"[yellow]{order['status']}[/yellow]",
         )
 
@@ -163,7 +177,12 @@ def _load_ticker_file(path: str) -> list[str]:
     return tickers
 
 
-def run(date: str, dry_run: bool = False, ticker_file: str | None = None):
+def run(
+    date: str,
+    dry_run: bool = False,
+    ticker_file: str | None = None,
+    tickers_override: list[str] | None = None,
+):
     console.print()
     console.print(
         Panel.fit(
@@ -177,8 +196,11 @@ def run(date: str, dry_run: bool = False, ticker_file: str | None = None):
     profile = _load_profile()
     portfolio = _load_portfolio()
 
-    # Ticker source: --ticker-file overrides portfolio config
-    if ticker_file:
+    # Ticker source priority: tickers_override > --ticker-file > portfolio config
+    if tickers_override is not None:
+        tickers = tickers_override
+        console.print(f"[dim]Tickers from screener:[/dim] {len(tickers)} tickers")
+    elif ticker_file:
         tickers = _load_ticker_file(ticker_file)
         console.print(f"[dim]Tickers from file:[/dim] {ticker_file} ({len(tickers)} tickers)")
     else:
@@ -224,7 +246,8 @@ def run(date: str, dry_run: bool = False, ticker_file: str | None = None):
     )
 
     # Stage orders
-    orders_doc = _recommendations_to_orders(result["recommendations"], date)
+    buffer_pct = profile.get("limit_price_buffer_pct", 0.5)
+    orders_doc = _recommendations_to_orders(result["recommendations"], date, buffer_pct)
     _print_orders_table(orders_doc["orders"])
 
     orders_path = _write_orders(orders_doc, date)

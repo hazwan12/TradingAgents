@@ -80,10 +80,16 @@ def _pending_orders_in(orders_doc: dict) -> list[dict]:
 
 def _print_order_summary(order: dict):
     direction_style = "green" if order["direction"] == "buy" else "red"
+    limit_str = (
+        f"  limit [bold]${order['limit_price']:,.4f}[/bold]"
+        if "limit_price" in order
+        else ""
+    )
     console.print(
         f"\n  [bold]{order['ticker']}[/bold] "
         f"[{direction_style}]{order['direction'].upper()}[/{direction_style}] "
-        f"{order['units']:.2f} units @ est. ${order['estimated_price']:,.2f} "
+        f"{order['units']:.2f} units @ est. ${order['estimated_price']:,.2f}"
+        f"{limit_str}  "
         f"(~${order['estimated_total']:,.2f})  "
         f"Rating: {order.get('rating', '—')}"
     )

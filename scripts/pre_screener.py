@@ -23,6 +23,7 @@ Scheduling (cron, runs 3:45 PM ET Mon-Fri, before nightly analysis at 3:55):
 import argparse
 import json
 import logging
+import re
 import sys
 import time
 from datetime import datetime, timedelta
@@ -56,6 +57,9 @@ REPORTS_DIR = Path("reports")
 # NASDAQ FTP — pipe-delimited lists of all US-listed securities
 NASDAQ_LISTED_URL = "https://ftp.nasdaqtrader.com/dynamic/SymDir/nasdaqlisted.txt"
 OTHER_LISTED_URL = "https://ftp.nasdaqtrader.com/dynamic/SymDir/otherlisted.txt"
+
+# GitHub mirror — fallback when NASDAQ FTP is blocked (e.g. outside US networks)
+GITHUB_ALL_TICKERS_URL = "https://raw.githubusercontent.com/rreichel3/US-Stock-Symbols/main/all/all_tickers.txt"
 
 # Curated index sources (fallback when NASDAQ FTP is unreachable)
 SP500_CSV_URL = "https://raw.githubusercontent.com/datasets/s-and-p-500-companies/main/data/constituents.csv"
@@ -116,11 +120,36 @@ def _parse_other_listed(raw: str) -> list[str]:
     return df.loc[mask, "ACT Symbol"].tolist()
 
 
+def _fetch_github_all_tickers() -> list[str]:
+    """Fetch US ticker list from GitHub mirror (rreichel3/US-Stock-Symbols)."""
+    raw = _fetch_url(GITHUB_ALL_TICKERS_URL)
+    tickers = [
+        t.strip().upper()
+        for t in raw.splitlines()
+        if t.strip() and re.match(r"^[A-Z]{1,5}$", t.strip())
+    ]
+    return sorted(set(tickers))
+
+
 def _fetch_full_universe() -> list[str]:
-    """Fetch all US-listed stocks from NASDAQ FTP (~9,000 tickers). Requires open internet."""
-    nasdaq = _parse_nasdaq_listed(_fetch_url(NASDAQ_LISTED_URL))
-    other = _parse_other_listed(_fetch_url(OTHER_LISTED_URL))
-    return sorted(set(nasdaq + other))
+    """Fetch all US-listed stocks (~9,000 tickers).
+
+    Tries NASDAQ FTP first. If that times out or is blocked (common outside the
+    US), silently falls back to a GitHub-hosted mirror that covers the same
+    universe.
+    """
+    try:
+        nasdaq = _parse_nasdaq_listed(_fetch_url(NASDAQ_LISTED_URL))
+        other = _parse_other_listed(_fetch_url(OTHER_LISTED_URL))
+        return sorted(set(nasdaq + other))
+    except Exception as ftp_err:
+        console.print(
+            f"[yellow]NASDAQ FTP unreachable ({type(ftp_err).__name__}), "
+            "switching to GitHub mirror...[/yellow]"
+        )
+        tickers = _fetch_github_all_tickers()
+        console.print(f"[dim]GitHub mirror: {len(tickers)} tickers loaded.[/dim]")
+        return tickers
 
 
 def _fetch_sp500() -> list[str]:

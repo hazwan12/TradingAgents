@@ -16,6 +16,8 @@ import questionary
 
 load_dotenv()
 
+sys.path.insert(0, str(Path(__file__).parent.parent))
+
 console = Console()
 
 TRADINGAGENTS_HOME = Path.home() / ".tradingagents"
@@ -45,6 +47,23 @@ PROVIDER_MODELS = {
     },
 }
 
+# Keywords that trigger the pre-screener pipeline instead of manual entry.
+# Maps user input → pre_screener.fetch_universe source name.
+_UNIVERSE_KEYWORDS = {
+    "all":              "full",
+    "full":             "full",
+    "sp500":            "sp500",
+    "nasdaq100":        "nasdaq100",
+    "sp500+nasdaq100":  "sp500+nasdaq100",
+}
+
+_UNIVERSE_LABELS = {
+    "full":             "All US-listed stocks via NASDAQ FTP (~9,000) — catches emerging tickers",
+    "sp500":            "S&P 500 constituents (~500)",
+    "nasdaq100":        "Nasdaq 100 constituents (~100)",
+    "sp500+nasdaq100":  "S&P 500 + Nasdaq 100 union (~550)",
+}
+
 
 def _print_header():
     console.print()
@@ -63,12 +82,16 @@ def _print_summary(profile: dict, portfolio: dict):
     console.print(Rule("[bold green]Profile Summary[/bold green]"))
     console.print()
 
+    ticker_display = ", ".join(portfolio["tickers"][:10])
+    if len(portfolio["tickers"]) > 10:
+        ticker_display += f" … (+{len(portfolio['tickers']) - 10} more)"
+
     t = Table(box=box.ROUNDED, show_header=False, padding=(0, 1))
     t.add_column("Key", style="bold dim", width=24)
     t.add_column("Value", style="white")
 
     t.add_row("Cash budget", f"${portfolio['budget']:,.2f}")
-    t.add_row("Tickers", ", ".join(portfolio["tickers"]))
+    t.add_row("Tickers", f"{len(portfolio['tickers'])} — {ticker_display}")
     t.add_row("LLM provider", profile["llm_provider"])
     t.add_row("Deep model", profile["deep_think_llm"])
     t.add_row("Quick model", profile["quick_think_llm"])
@@ -91,13 +114,69 @@ def _ask_budget() -> float:
     return float(raw)
 
 
+def _run_screener(universe_source: str) -> list[str]:
+    """Run the pre-screener pipeline and return the ranked ticker list."""
+    from scripts.pre_screener import screen
+
+    label = _UNIVERSE_LABELS.get(universe_source, universe_source)
+    console.print()
+    console.print(f"[dim]Universe: {label}[/dim]")
+
+    top_raw = questionary.text(
+        "How many top candidates to keep?",
+        default="20",
+        validate=lambda v: (v.isdigit() and int(v) >= 1) or "Enter a positive number",
+    ).ask()
+    if top_raw is None:
+        sys.exit(0)
+    top_n = int(top_raw)
+
+    if universe_source == "full":
+        console.print(
+            "[yellow]Scanning the full US market (~9,000 tickers). "
+            "This takes a few minutes — emerging stocks included.[/yellow]"
+        )
+
+    console.print()
+    result = screen(top_n=top_n, universe_source=universe_source)
+
+    if not result.get("success"):
+        console.print("[red]Pre-screener failed. Please enter tickers manually.[/red]")
+        return []
+
+    tickers = result.get("candidates", [])
+    console.print(
+        f"\n[green]Screener found {len(tickers)} candidates:[/green] "
+        + ", ".join(tickers)
+    )
+    return tickers
+
+
 def _ask_tickers() -> list[str]:
+    console.print(
+        "[dim]Enter comma-separated tickers (e.g. NVDA,AAPL,MSFT) or a universe keyword:\n"
+        "  all / full       — full US market via NASDAQ FTP (~9,000 tickers, catches emerging stocks)\n"
+        "  sp500            — S&P 500 constituents\n"
+        "  nasdaq100        — Nasdaq 100 constituents\n"
+        "  sp500+nasdaq100  — union of both[/dim]"
+    )
     raw = questionary.text(
-        "Tickers to track (comma-separated, e.g. NVDA,AAPL,MSFT):",
-        validate=lambda v: len(v.strip()) > 0 or "Enter at least one ticker",
+        "Tickers / universe:",
+        validate=lambda v: len(v.strip()) > 0 or "Enter tickers or a universe keyword",
     ).ask()
     if raw is None:
         sys.exit(0)
+
+    keyword = raw.strip().lower()
+    if keyword in _UNIVERSE_KEYWORDS:
+        universe_source = _UNIVERSE_KEYWORDS[keyword]
+        tickers = _run_screener(universe_source)
+        if tickers:
+            return tickers
+        # Fall through to manual entry on screener failure
+        console.print("[yellow]Falling back to manual ticker entry.[/yellow]")
+        return _ask_tickers()
+
     return [t.strip().upper() for t in raw.split(",") if t.strip()]
 
 
@@ -152,6 +231,23 @@ def _ask_workers() -> int:
     return int(raw)
 
 
+def _ask_limit_buffer() -> float:
+    console.print(
+        "[dim]Limit price buffer: buys are placed this % above the estimated price to\n"
+        "  ensure fill; sells this % below. 0.5% is a safe default for liquid US stocks.[/dim]"
+    )
+    raw = questionary.text(
+        "Limit price buffer % (e.g. 0.5):",
+        default="0.5",
+        validate=lambda v: (
+            v.replace(".", "", 1).isdigit() and 0.0 <= float(v) <= 5.0
+        ) or "Enter a number between 0 and 5",
+    ).ask()
+    if raw is None:
+        sys.exit(0)
+    return float(raw)
+
+
 def _ask_existing_holdings(tickers: list[str]) -> dict[str, float]:
     has_holdings = questionary.confirm(
         "Do you already hold any of these stocks?", default=False
@@ -199,8 +295,9 @@ def run_wizard():
     provider, deep_model, quick_model = _ask_provider()
 
     console.print()
-    console.print("[dim]Step 4 of 5 — Performance[/dim]")
+    console.print("[dim]Step 4 of 5 — Performance & order settings[/dim]")
     max_workers = _ask_workers()
+    limit_buffer = _ask_limit_buffer()
 
     console.print()
     console.print("[dim]Step 5 of 5 — Confirm[/dim]")
@@ -212,6 +309,7 @@ def run_wizard():
         "deep_think_llm": deep_model,
         "quick_think_llm": quick_model,
         "max_workers": max_workers,
+        "limit_price_buffer_pct": limit_buffer,
     }
 
     portfolio = {
