@@ -269,7 +269,7 @@ class WatchlistScanner:
             ]
         )
 
-        md_path.write_text("\n".join(lines))
+        md_path.write_text("\n".join(lines), encoding="utf-8")
         logger.info(f"Markdown summary written to {md_path}")
         return md_path
 

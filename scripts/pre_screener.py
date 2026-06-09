@@ -26,7 +26,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime, timedelta
+from datetime import datetime
 from io import StringIO
 from pathlib import Path
 
@@ -221,8 +221,11 @@ def fetch_universe(source: str = "full", force_refresh: bool = False) -> list[st
                 raise
             raise
 
-    tickers = sorted(all_tickers)
-    cache_path.write_text(json.dumps({"fetched_at": datetime.now().isoformat(), "source": source, "tickers": tickers}))
+    # Sanitize: US universe must be plain uppercase letters only (1–5 chars).
+    # Strips exchange/market-category suffixes like .NCM, .TO, .NGS that leak
+    # in from NASDAQ FTP or GitHub mirror caches built before filtering was added.
+    tickers = sorted({t for t in all_tickers if re.match(r'^[A-Z]{1,5}$', t)})
+    cache_path.write_text(json.dumps({"fetched_at": datetime.now().isoformat(), "source": source, "tickers": tickers}), encoding="utf-8")
     console.print(f"[dim]Universe '{source}': {len(tickers)} tickers cached.[/dim]")
     return tickers
 
@@ -510,7 +513,8 @@ def _write_output(df: pd.DataFrame, date: str) -> Path:
                 "candidates": df.to_dict(orient="records"),
             },
             indent=2,
-        )
+        ),
+        encoding="utf-8",
     )
     return out_path
 

@@ -130,7 +130,7 @@ def _recommendations_to_orders(
 def _write_orders(orders_doc: dict, date: str) -> Path:
     ORDERS_DIR.mkdir(parents=True, exist_ok=True)
     path = ORDERS_DIR / f"ORDERS_{date}.json"
-    path.write_text(json.dumps(orders_doc, indent=2))
+    path.write_text(json.dumps(orders_doc, indent=2), encoding="utf-8")
     return path
 
 

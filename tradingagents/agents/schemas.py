@@ -21,7 +21,20 @@ from __future__ import annotations
 from enum import Enum
 from typing import Literal, Optional
 
-from pydantic import BaseModel, Field
+from pydantic import BaseModel, Field, field_validator
+
+
+def _unwrap_schema_value(v):
+    """Coerce {'type': 'string', 'value': 'X'} → 'X'.
+
+    Weak Ollama models sometimes echo the JSON Schema field descriptor instead
+    of a concrete value. This validator catches that pattern before Pydantic
+    tries to coerce the dict into an enum, preventing a validation error that
+    would otherwise trigger the free-text fallback on every call.
+    """
+    if isinstance(v, dict) and "value" in v:
+        return v["value"]
+    return v
 
 
 # ---------------------------------------------------------------------------
@@ -68,6 +81,7 @@ class ResearchPlan(BaseModel):
     """
 
     recommendation: PortfolioRating = Field(
+        default=PortfolioRating.HOLD,
         description=(
             "The investment recommendation. Exactly one of Buy / Overweight / "
             "Hold / Underweight / Sell. Reserve Hold for situations where the "
@@ -76,6 +90,7 @@ class ResearchPlan(BaseModel):
         ),
     )
     rationale: str = Field(
+        default="",
         description=(
             "Conversational summary of the key points from both sides of the "
             "debate, ending with which arguments led to the recommendation. "
@@ -83,11 +98,17 @@ class ResearchPlan(BaseModel):
         ),
     )
     strategic_actions: str = Field(
+        default="",
         description=(
             "Concrete steps for the trader to implement the recommendation, "
             "including position sizing guidance consistent with the rating."
         ),
     )
+
+    @field_validator("recommendation", mode="before")
+    @classmethod
+    def _coerce_recommendation(cls, v):
+        return _unwrap_schema_value(v)
 
 
 def render_research_plan(plan: ResearchPlan) -> str:
@@ -116,14 +137,21 @@ class TraderProposal(BaseModel):
     """
 
     action: TraderAction = Field(
+        default=TraderAction.HOLD,
         description="The transaction direction. Exactly one of Buy / Hold / Sell.",
     )
     reasoning: str = Field(
+        default="",
         description=(
             "The case for this action, anchored in the analysts' reports and "
             "the research plan. Two to four sentences."
         ),
     )
+
+    @field_validator("action", mode="before")
+    @classmethod
+    def _coerce_action(cls, v):
+        return _unwrap_schema_value(v)
     entry_price: Optional[float] = Field(
         default=None,
         description="Optional entry price target in the instrument's quote currency.",
@@ -178,24 +206,32 @@ class PortfolioDecision(BaseModel):
     """
 
     rating: PortfolioRating = Field(
+        default=PortfolioRating.HOLD,
         description=(
             "The final position rating. Exactly one of Buy / Overweight / Hold / "
             "Underweight / Sell, picked based on the analysts' debate."
         ),
     )
     executive_summary: str = Field(
+        default="",
         description=(
             "A concise action plan covering entry strategy, position sizing, "
             "key risk levels, and time horizon. Two to four sentences."
         ),
     )
     investment_thesis: str = Field(
+        default="",
         description=(
             "Detailed reasoning anchored in specific evidence from the analysts' "
             "debate. If prior lessons are referenced in the prompt context, "
             "incorporate them; otherwise rely solely on the current analysis."
         ),
     )
+
+    @field_validator("rating", mode="before")
+    @classmethod
+    def _coerce_rating(cls, v):
+        return _unwrap_schema_value(v)
     price_target: Optional[float] = Field(
         default=None,
         description="Optional target price in the instrument's quote currency.",
@@ -260,6 +296,7 @@ class SentimentReport(BaseModel):
     """
 
     overall_band: SentimentBand = Field(
+        default=SentimentBand.NEUTRAL,
         description=(
             "Overall sentiment direction. Exactly one of: "
             "Bullish / Mildly Bullish / Neutral / Mixed / Mildly Bearish / Bearish. "
@@ -268,6 +305,7 @@ class SentimentReport(BaseModel):
         ),
     )
     overall_score: float = Field(
+        default=5.0,
         ge=0.0,
         le=10.0,
         description=(
@@ -280,6 +318,7 @@ class SentimentReport(BaseModel):
         ),
     )
     confidence: Literal["low", "medium", "high"] = Field(
+        default="low",
         description=(
             "Confidence in the assessment based on data quality and sample size. "
             "Use 'low' when one or more sources returned a placeholder or fewer "
@@ -288,6 +327,7 @@ class SentimentReport(BaseModel):
         ),
     )
     narrative: str = Field(
+        default="Insufficient data available across all sources to generate a sentiment analysis for this ticker.",
         description=(
             "Full sentiment report covering, in order: "
             "(1) source-by-source breakdown with specific evidence (cite message "

@@ -107,12 +107,27 @@ def build_instrument_context(
     classification are injected so agents anchor to the real company rather
     than pattern-matching the price chart to a wrong one (#814).
     """
+    # Maps raw yfinance exchange codes to human-readable names so the LLM
+    # understands the market without guessing from an opaque code.
+    _EXCHANGE_LABELS = {
+        "NMS": "NASDAQ Global Select Market (US)",
+        "NGM": "NASDAQ Global Market (US)",
+        "NCM": "NASDAQ Capital Market (US)",
+        "NYQ": "NYSE (US)",
+        "NYA": "NYSE American (US)",
+        "PCX": "NYSE Arca (US)",
+        "ASE": "NYSE American (US)",
+        "BTS": "OTC Bulletin Board (US)",
+        "OTC": "OTC Markets (US)",
+    }
+
     is_crypto = asset_type == "crypto"
     instrument_label = "asset" if is_crypto else "instrument"
     context = (
         f"The {instrument_label} to analyze is `{ticker}`. "
-        "Use this exact ticker in every tool call, report, and recommendation, "
-        "preserving any exchange suffix (e.g. `.TO`, `.L`, `.HK`, `.T`, `-USD`)."
+        "Use ONLY this exact ticker string in every tool call, report, and recommendation. "
+        "Do NOT add, remove, or modify any part of the ticker — including exchange suffixes "
+        "(e.g. `.NS`, `.L`, `.HK`, `.T`, `-USD`). The ticker has been validated; treat it as-is."
     )
 
     details = []
@@ -127,8 +142,10 @@ def build_instrument_context(
             details.append(f"Sector: {sector}")
         elif industry:
             details.append(f"Industry: {industry}")
-        if identity.get("exchange"):
-            details.append(f"Exchange: {identity['exchange']}")
+        raw_exchange = identity.get("exchange")
+        if raw_exchange:
+            exchange_label = _EXCHANGE_LABELS.get(raw_exchange, raw_exchange)
+            details.append(f"Exchange: {exchange_label}")
 
     if details:
         context += (

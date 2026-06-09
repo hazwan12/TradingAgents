@@ -234,6 +234,13 @@ class TradingAgentsGraph:
         """
         try:
             start = datetime.strptime(trade_date, "%Y-%m-%d")
+            # Skip the fetch entirely when the trade date is today or in the future:
+            # the holding period hasn't elapsed yet, so there is no return to compute.
+            # Returning None here triggers the "try again next run" path cleanly and
+            # avoids a noisy yfinance warning about a future date range.
+            from datetime import date as _date
+            if start.date() >= _date.today():
+                return None, None, None
             end = start + timedelta(days=holding_days + 7)  # buffer for weekends/holidays
             end_str = end.strftime("%Y-%m-%d")
 

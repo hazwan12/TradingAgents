@@ -177,7 +177,7 @@ def _load_portfolio() -> dict:
 
 def _save_portfolio(portfolio: dict):
     PORTFOLIO_CONFIG_PATH.parent.mkdir(parents=True, exist_ok=True)
-    PORTFOLIO_CONFIG_PATH.write_text(json.dumps(portfolio, indent=2))
+    PORTFOLIO_CONFIG_PATH.write_text(json.dumps(portfolio, indent=2), encoding="utf-8")
 
 
 def run(host: str, port: int, dry_run: bool, yes: bool, paper: bool):

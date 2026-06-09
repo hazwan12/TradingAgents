@@ -50,15 +50,15 @@ def _load_portfolio() -> dict:
 
 
 def _save_portfolio(portfolio: dict):
-    PORTFOLIO_CONFIG_PATH.write_text(json.dumps(portfolio, indent=2))
+    PORTFOLIO_CONFIG_PATH.write_text(json.dumps(portfolio, indent=2), encoding="utf-8")
 
 
 def _load_orders(path: Path) -> dict:
-    return json.loads(path.read_text())
+    return json.loads(path.read_text(encoding="utf-8"))
 
 
 def _save_orders(orders_doc: dict, path: Path):
-    path.write_text(json.dumps(orders_doc, indent=2))
+    path.write_text(json.dumps(orders_doc, indent=2), encoding="utf-8")
 
 
 def _append_transaction(record: dict):

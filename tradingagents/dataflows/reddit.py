@@ -1,26 +1,50 @@
 """Reddit search fetcher for ticker-specific discussion posts.
 
-Primary path is Reddit's public JSON search endpoint
-(``reddit.com/r/{sub}/search.json``), which carries the richest data
-(score, comment count, body). Reddit's WAF increasingly returns
-``HTTP 403 Blocked`` on that endpoint (issue #862), so when the JSON request
-fails we transparently fall back to the public Atom/RSS search feed
-(``/search.rss``). The RSS feed is gated less aggressively and serves the
-same descriptive User-Agent we already send; the fallback lacks score /
-comment counts, so RSS-sourced posts are marked and the formatter omits those
-metrics rather than printing fake zeros.
+Authentication hierarchy
+------------------------
+1. **OAuth2 (application-only)** — used when ``REDDIT_CLIENT_ID`` and
+   ``REDDIT_CLIENT_SECRET`` are set in the environment.  Requests go to
+   ``oauth.reddit.com``, bypass Reddit's WAF entirely, and carry full data
+   (score, comment count, post body).  The bearer token is cached in memory
+   for 55 minutes and refreshed automatically.
 
-No API key required either way. Returns formatted plaintext blocks ready for
-prompt injection and degrades gracefully — returns a placeholder string
-rather than raising, so callers never special-case missing data.
+2. **RSS fallback** — used when OAuth credentials are absent *or* when the
+   OAuth call itself fails.  The public Atom/RSS search feed is less
+   aggressively gated than the JSON endpoint.  It lacks score / comment
+   counts, so RSS-sourced posts are tagged and the formatter omits those
+   metrics rather than printing fake zeros.
+
+Reddit's public JSON endpoint (``www.reddit.com/r/{sub}/search.json``) is
+*not* attempted without credentials — Reddit's WAF returns ``HTTP 403
+Blocked`` for all unauthenticated script requests routed through the SIN CDN
+edge, confirmed by inspecting the response headers (``server-timing:
+reddit-ct;desc="dn=FT,p=SIN"``).
+
+Setup (optional — RSS works without this)
+------------------------------------------
+1. Go to https://www.reddit.com/prefs/apps and create a new app:
+   - Type: **script**
+   - Name / description: anything
+   - Redirect URI: http://localhost (unused for script apps)
+2. Copy the client_id (shown under the app name) and client_secret.
+3. Add to ``.env``::
+
+       REDDIT_CLIENT_ID=your_client_id
+       REDDIT_CLIENT_SECRET=your_client_secret
+
+No Reddit account or user OAuth flow is needed — application-only credentials
+are sufficient for read access.
 """
 
 from __future__ import annotations
 
+import base64
 import html
 import json
 import logging
+import os
 import re
+import threading
 import time
 import xml.etree.ElementTree as ET
 from datetime import datetime
@@ -31,19 +55,79 @@ from urllib.request import Request, urlopen
 
 logger = logging.getLogger(__name__)
 
-_API = "https://www.reddit.com/r/{sub}/search.json?{qs}"
 _RSS = "https://www.reddit.com/r/{sub}/search.rss?{qs}"
-# A descriptive, identified User-Agent (per Reddit's API etiquette). Reddit
-# blocks generic/anonymous tokens like bare "Mozilla/5.0" or "curl/…" but
-# serves this one on both endpoints; the RSS feed accepts it even when the
-# JSON search endpoint 403s, so no browser-spoofing is needed.
+_OAUTH_API = "https://oauth.reddit.com/r/{sub}/search.json?{qs}"
+_TOKEN_URL = "https://www.reddit.com/api/v1/access_token"
+
 _UA = "tradingagents/0.2 (+https://github.com/TauricResearch/TradingAgents)"
 _ATOM_NS = {"atom": "http://www.w3.org/2005/Atom"}
 
-# Default subreddits ordered roughly by signal density for ticker-specific
-# discussion. wallstreetbets has the most volume but most noise; stocks /
-# investing trend more measured. Caller can override.
+# Token cache — shared across threads, protected by _token_lock.
+_token_cache: dict = {"token": None, "expires_at": 0.0}
+_token_lock = threading.Lock()
+
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
+
+
+# ---------------------------------------------------------------------------
+# OAuth2 token management
+# ---------------------------------------------------------------------------
+
+
+def _oauth_credentials() -> tuple[str, str] | None:
+    """Return (client_id, client_secret) from env, or None if not configured."""
+    cid = os.environ.get("REDDIT_CLIENT_ID", "").strip()
+    secret = os.environ.get("REDDIT_CLIENT_SECRET", "").strip()
+    return (cid, secret) if cid and secret else None
+
+
+def _get_bearer_token(timeout: float = 10.0) -> str | None:
+    """Return a valid OAuth2 bearer token, fetching a new one only when needed.
+
+    Returns None if credentials are not configured or if the token request
+    fails (caller should fall back to RSS).
+    """
+    creds = _oauth_credentials()
+    if not creds:
+        return None
+
+    with _token_lock:
+        # Reuse cached token if it has more than 60 s left
+        if _token_cache["token"] and time.time() < _token_cache["expires_at"] - 60:
+            return _token_cache["token"]
+
+        client_id, client_secret = creds
+        auth = base64.b64encode(f"{client_id}:{client_secret}".encode()).decode()
+        body = urlencode({"grant_type": "client_credentials"}).encode()
+        req = Request(
+            _TOKEN_URL,
+            data=body,
+            headers={
+                "Authorization": f"Basic {auth}",
+                "User-Agent": _UA,
+                "Content-Type": "application/x-www-form-urlencoded",
+            },
+        )
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                payload = json.loads(resp.read())
+            token = payload.get("access_token")
+            expires_in = int(payload.get("expires_in", 3600))
+            if not token:
+                logger.warning("Reddit OAuth2: token response missing access_token: %s", payload)
+                return None
+            _token_cache["token"] = token
+            _token_cache["expires_at"] = time.time() + expires_in
+            logger.debug("Reddit OAuth2: new bearer token obtained (expires in %ds)", expires_in)
+            return token
+        except Exception as exc:
+            logger.warning("Reddit OAuth2: failed to obtain bearer token: %s", exc)
+            return None
+
+
+# ---------------------------------------------------------------------------
+# Search query string
+# ---------------------------------------------------------------------------
 
 
 def _search_qs(ticker: str, limit: int) -> str:
@@ -51,13 +135,17 @@ def _search_qs(ticker: str, limit: int) -> str:
         "q": ticker,
         "restrict_sr": "on",
         "sort": "new",
-        "t": "week",  # last 7 days
+        "t": "week",
         "limit": limit,
     })
 
 
+# ---------------------------------------------------------------------------
+# Timestamp / HTML helpers
+# ---------------------------------------------------------------------------
+
+
 def _iso_to_timestamp(iso_str: Optional[str]) -> Optional[float]:
-    """Parse an Atom ``published`` timestamp to a UTC epoch, or None."""
     if not iso_str:
         return None
     try:
@@ -68,14 +156,44 @@ def _iso_to_timestamp(iso_str: Optional[str]) -> Optional[float]:
 
 
 def _strip_html(content: str) -> str:
-    """Reduce the HTML body Reddit embeds in an Atom entry to plain text."""
     if not content:
         return ""
-    # Reddit wraps the real selftext between SC_OFF / SC_ON markers.
     if "<!-- SC_OFF -->" in content and "<!-- SC_ON -->" in content:
         content = content.split("<!-- SC_OFF -->")[1].split("<!-- SC_ON -->")[0]
     text = re.sub(r"<[^>]+>", " ", content)
     return " ".join(html.unescape(text).split())
+
+
+# ---------------------------------------------------------------------------
+# Fetch paths
+# ---------------------------------------------------------------------------
+
+
+def _fetch_subreddit_oauth(
+    ticker: str,
+    sub: str,
+    limit: int,
+    timeout: float,
+    token: str,
+) -> list[dict]:
+    """Fetch via OAuth2 — returns full post data including scores."""
+    url = _OAUTH_API.format(sub=sub, qs=_search_qs(ticker, limit))
+    req = Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {token}",
+            "User-Agent": _UA,
+            "Accept": "application/json",
+        },
+    )
+    try:
+        with urlopen(req, timeout=timeout) as resp:
+            payload = json.loads(resp.read())
+        children = (payload.get("data") or {}).get("children") or []
+        return [c.get("data", {}) for c in children if isinstance(c, dict)]
+    except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
+        logger.warning("Reddit OAuth fetch failed for r/%s · %s: %s", sub, ticker, exc)
+        return []
 
 
 def _fetch_subreddit_rss(
@@ -84,11 +202,7 @@ def _fetch_subreddit_rss(
     limit: int,
     timeout: float,
 ) -> list[dict]:
-    """Fallback path: parse the public Atom search feed for a subreddit.
-
-    Carries no score / comment counts, so those fields are left None and the
-    post is tagged ``source="rss"`` for honest display.
-    """
+    """Fallback: public Atom/RSS feed — no scores or comment counts."""
     url = _RSS.format(sub=sub, qs=_search_qs(ticker, limit))
     req = Request(url, headers={"User-Agent": _UA})
     try:
@@ -122,19 +236,22 @@ def _fetch_subreddit(
     limit: int,
     timeout: float,
 ) -> list[dict]:
-    url = _API.format(sub=sub, qs=_search_qs(ticker, limit))
-    req = Request(url, headers={"User-Agent": _UA, "Accept": "application/json"})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            payload = json.loads(resp.read())
-        children = (payload.get("data") or {}).get("children") or []
-        return [c.get("data", {}) for c in children if isinstance(c, dict)]
-    except (HTTPError, URLError, json.JSONDecodeError, TimeoutError) as exc:
-        logger.warning(
-            "Reddit JSON fetch failed for r/%s · %s: %s — falling back to RSS feed.",
-            sub, ticker, exc,
-        )
-        return _fetch_subreddit_rss(ticker, sub, limit, timeout)
+    """Try OAuth2 first; fall back to RSS."""
+    token = _get_bearer_token(timeout=timeout)
+    if token:
+        posts = _fetch_subreddit_oauth(ticker, sub, limit, timeout, token)
+        if posts:
+            return posts
+        # OAuth succeeded but returned no posts — genuine empty result, skip RSS
+        logger.debug("Reddit OAuth: no posts for r/%s · %s", sub, ticker)
+        return []
+    # No credentials configured — go straight to RSS
+    return _fetch_subreddit_rss(ticker, sub, limit, timeout)
+
+
+# ---------------------------------------------------------------------------
+# Public API
+# ---------------------------------------------------------------------------
 
 
 def fetch_reddit_posts(
@@ -144,11 +261,10 @@ def fetch_reddit_posts(
     timeout: float = 10.0,
     inter_request_delay: float = 0.4,
 ) -> str:
-    """Fetch recent Reddit posts mentioning ``ticker`` across finance
-    subreddits and return them as a formatted plaintext block.
+    """Fetch recent Reddit posts mentioning ``ticker`` across finance subreddits.
 
-    ``inter_request_delay`` keeps us under Reddit's public rate limit
-    (~10 req/min per IP) even if the caller queries many subreddits.
+    Returns a formatted plaintext block ready for prompt injection.
+    Degrades gracefully — returns a placeholder string rather than raising.
     """
     blocks = []
     total_posts = 0
@@ -163,18 +279,14 @@ def fetch_reddit_posts(
 
         via_rss = any(p.get("source") == "rss" for p in posts)
         header = f"r/{sub} — {len(posts)} recent posts mentioning {ticker.upper()}"
-        header += " (via RSS feed; scores/comments unavailable):" if via_rss else ":"
+        header += " (via RSS; scores/comments unavailable):" if via_rss else ":"
         lines = [header]
         for p in posts:
             title = (p.get("title") or "").replace("\n", " ").strip()
             score = p.get("score")
             comments = p.get("num_comments")
             created = p.get("created_utc")
-            created_str = (
-                time.strftime("%Y-%m-%d", time.gmtime(created)) if created else "?"
-            )
-            # Score / comment counts are absent on the RSS fallback path —
-            # show them only when present rather than printing fake zeros.
+            created_str = time.strftime("%Y-%m-%d", time.gmtime(created)) if created else "?"
             meta = created_str
             if score is not None and comments is not None:
                 meta += f" · {score:>4}↑ · {comments:>3}c"

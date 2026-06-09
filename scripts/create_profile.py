@@ -349,8 +349,8 @@ def run_wizard():
         return
 
     TRADINGAGENTS_HOME.mkdir(parents=True, exist_ok=True)
-    PROFILE_PATH.write_text(json.dumps(profile, indent=2))
-    PORTFOLIO_CONFIG_PATH.write_text(json.dumps(portfolio, indent=2))
+    PROFILE_PATH.write_text(json.dumps(profile, indent=2), encoding="utf-8")
+    PORTFOLIO_CONFIG_PATH.write_text(json.dumps(portfolio, indent=2), encoding="utf-8")
 
     console.print()
     console.print("[bold green]Profile saved![/bold green]")
