@@ -47,6 +47,9 @@ PROVIDER_MODELS = {
     },
 }
 
+# Sentinel stored in profile when auto-detect is chosen.
+_AUTO_PROVIDER = "auto"
+
 # Keywords that trigger the pre-screener pipeline instead of manual entry.
 # Maps user input → pre_screener.fetch_universe source name.
 _UNIVERSE_KEYWORDS = {
@@ -92,9 +95,16 @@ def _print_summary(profile: dict, portfolio: dict):
 
     t.add_row("Cash budget", f"${portfolio['budget']:,.2f}")
     t.add_row("Tickers", f"{len(portfolio['tickers'])} — {ticker_display}")
-    t.add_row("LLM provider", profile["llm_provider"])
-    t.add_row("Deep model", profile["deep_think_llm"])
-    t.add_row("Quick model", profile["quick_think_llm"])
+
+    if profile["llm_provider"] == _AUTO_PROVIDER:
+        t.add_row("LLM provider", "[dim]auto (GPU → Ollama/Qwen, else Gemini)[/dim]")
+        t.add_row("Deep model", "[dim]resolved at runtime[/dim]")
+        t.add_row("Quick model", "[dim]resolved at runtime[/dim]")
+    else:
+        t.add_row("LLM provider", profile["llm_provider"])
+        t.add_row("Deep model", profile["deep_think_llm"])
+        t.add_row("Quick model", profile["quick_think_llm"])
+
     t.add_row("Max workers", str(profile["max_workers"]))
     t.add_row("Profile path", str(PROFILE_PATH))
     t.add_row("Portfolio config", str(PORTFOLIO_CONFIG_PATH))
@@ -181,9 +191,15 @@ def _ask_tickers() -> list[str]:
 
 
 def _ask_provider() -> tuple[str, str, str]:
+    from tradingagents.llm_clients.auto_detect import detect_provider_verbose
+
     provider = questionary.select(
         "LLM provider:",
         choices=[
+            questionary.Choice(
+                "Auto-detect  [GPU present → Ollama/Qwen, otherwise Gemini]",
+                value=_AUTO_PROVIDER,
+            ),
             questionary.Choice(
                 f"Google Gemini  [{PROVIDER_MODELS['google']['note']}]", value="google"
             ),
@@ -200,6 +216,12 @@ def _ask_provider() -> tuple[str, str, str]:
     ).ask()
     if provider is None:
         sys.exit(0)
+
+    if provider == _AUTO_PROVIDER:
+        cfg, reason = detect_provider_verbose()
+        console.print(f"  [dim]Detected: {reason}[/dim]")
+        # Store the sentinel; nightly_analysis resolves it at runtime
+        return _AUTO_PROVIDER, _AUTO_PROVIDER, _AUTO_PROVIDER
 
     defaults = PROVIDER_MODELS[provider]
 

@@ -65,9 +65,20 @@ def _load_portfolio() -> dict:
 
 def _build_config(profile: dict) -> dict:
     config = DEFAULT_CONFIG.copy()
-    config["llm_provider"] = profile.get("llm_provider", config["llm_provider"])
-    config["deep_think_llm"] = profile.get("deep_think_llm", config["deep_think_llm"])
-    config["quick_think_llm"] = profile.get("quick_think_llm", config["quick_think_llm"])
+    provider = profile.get("llm_provider", config["llm_provider"])
+
+    if provider == "auto":
+        from tradingagents.llm_clients.auto_detect import detect_provider_verbose
+        detected, reason = detect_provider_verbose()
+        console.print(f"  [dim]Auto-detect: {reason}[/dim]")
+        config["llm_provider"] = detected["llm_provider"]
+        config["deep_think_llm"] = detected["deep_think_llm"]
+        config["quick_think_llm"] = detected["quick_think_llm"]
+    else:
+        config["llm_provider"] = provider
+        config["deep_think_llm"] = profile.get("deep_think_llm", config["deep_think_llm"])
+        config["quick_think_llm"] = profile.get("quick_think_llm", config["quick_think_llm"])
+
     return config
 
 

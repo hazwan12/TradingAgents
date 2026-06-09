@@ -32,6 +32,9 @@ dependencies = [
     "yfinance>=1.4.1",
 ]
 
+[project.optional-dependencies]
+moomoo = ["moomoo-openapi>=1.0.0"]
+
 [project.scripts]
 tradingagents = "cli.main:app"
 
