@@ -1,2 +1,0 @@
-I am not sure what it is called but I want to use this to trade when the market is closed. So there will be a daily batch that will run and analyse buy/sell signals, based on the report I will put in the order that will execute when the market opens. There should be a way to update easily the holding is bought or sold.
-Also a wizard or a guide to help user create a profile and ask the initial investment amount

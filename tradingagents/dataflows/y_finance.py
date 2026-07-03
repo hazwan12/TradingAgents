@@ -18,6 +18,32 @@ def get_YFin_data_online(
 
     # Resolve broker/forex symbols to Yahoo's convention (XAUUSD+ -> GC=F).
     canonical = normalize_symbol(symbol)
+
+    # Try the incremental SQLite cache first — if the screener already ran today
+    # the bars are already there and no network call is needed.
+    try:
+        from .ohlcv_cache import _cache
+        _cache.ensure_cached([canonical], start_date, end_date)
+        data = _cache.get_ohlcv(canonical, start_date, end_date)
+        if not data.empty:
+            # Normalise column names to match the live-fetch path
+            data.index.name = "Date"
+            if "Adj Close" not in data.columns:
+                data["Adj Close"] = data["Close"]
+            data = data[["Open", "High", "Low", "Close", "Adj Close", "Volume"]]
+            # Skip the live fetch below
+            if data.index.tz is not None:
+                data.index = data.index.tz_localize(None)
+            data = data.round(2)
+            csv_string = data.to_csv()
+            label = canonical if canonical == symbol.upper() else f"{canonical} (from {symbol})"
+            header = f"# Stock data for {label} from {start_date} to {end_date}\n"
+            header += f"# Total records: {len(data)}\n"
+            header += f"# Data retrieved on: {datetime.now().strftime('%Y-%m-%d %H:%M:%S')}\n\n"
+            return header + csv_string
+    except Exception:
+        pass  # Cache unavailable — fall through to live fetch
+
     ticker = yf.Ticker(canonical)
 
     # Fetch historical data for the specified date range

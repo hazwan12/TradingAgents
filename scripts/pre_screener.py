@@ -26,7 +26,7 @@ import logging
 import re
 import sys
 import time
-from datetime import datetime
+from datetime import datetime, timedelta
 from io import StringIO
 from pathlib import Path
 
@@ -161,14 +161,17 @@ def _fetch_sp500() -> list[str]:
 
 def _fetch_nasdaq100() -> list[str]:
     """Fetch Nasdaq 100 constituents from Wikipedia (~100 tickers)."""
-    tables = pd.read_html(WIKI_NASDAQ100_URL)
+    # Wikipedia returns 403 for requests with no User-Agent (pd.read_html(url) hits
+    # this directly via urllib); fetch the HTML ourselves with a browser UA instead.
+    raw = _fetch_url(WIKI_NASDAQ100_URL, headers={"User-Agent": "Mozilla/5.0"})
+    tables = pd.read_html(StringIO(raw))
     # The components table on Wikipedia has a 'Ticker' or 'Symbol' column
     for t in tables:
-        cols = [c.lower() for c in t.columns]
+        cols = [str(c).lower() for c in t.columns]
         for candidate in ("ticker", "symbol"):
             if candidate in cols:
-                col = t.columns[[c.lower() for c in t.columns].index(candidate)]
-                return sorted(t[col].dropna().str.upper().tolist())
+                col = t.columns[cols.index(candidate)]
+                return sorted(t[col].dropna().astype(str).str.upper().tolist())
     raise ValueError("Could not find Nasdaq 100 ticker column in Wikipedia tables")
 
 
@@ -236,7 +239,36 @@ def fetch_universe(source: str = "full", force_refresh: bool = False) -> list[st
 
 
 def _batch_download(tickers: list[str], period: str, batch_size: int = DOWNLOAD_BATCH_SIZE) -> pd.DataFrame:
-    """Download OHLCV for all tickers in batches, return Close + Volume DataFrame."""
+    """Return Close + Volume DataFrame for all tickers, using the incremental
+    SQLite cache. Only downloads bars not already cached — subsequent runs for
+    the same universe fetch only the 1–2 new trading days since last run.
+    Falls back to direct yfinance if the cache returns no data."""
+    try:
+        from tradingagents.dataflows.ohlcv_cache import _cache
+
+        # Use yesterday as end_date — today's US market data isn't available until
+        # after 4 PM ET (midnight SGT), and we always run after market close anyway.
+        end_date = (datetime.now() - timedelta(days=1)).strftime("%Y-%m-%d")
+        days = FAST_FILTER_DAYS if period == f"{FAST_FILTER_DAYS}d" else PRICE_LOOKBACK_DAYS
+        # Wider window to ensure enough trading days after weekends/holidays
+        start_date = (datetime.now() - timedelta(days=int(days * 1.6))).strftime("%Y-%m-%d")
+
+        console.print(f"[dim]  Downloading price data (incremental cache)...[/dim]")
+        _cache.ensure_cached(tickers, start_date, end_date, batch_size=batch_size)
+
+        df = _cache.get_wide(tickers, start_date, end_date)
+        if not df.empty:
+            return df
+        logger.warning("OHLCV cache returned empty — falling back to direct yfinance download")
+    except Exception as exc:
+        logger.warning("OHLCV cache error (%s) — falling back to direct yfinance download", exc)
+
+    # Fallback: original direct yfinance download
+    return _batch_download_direct(tickers, period, batch_size)
+
+
+def _batch_download_direct(tickers: list[str], period: str, batch_size: int = DOWNLOAD_BATCH_SIZE) -> pd.DataFrame:
+    """Original direct yfinance download — used as fallback when the cache fails."""
     frames = []
     total_batches = (len(tickers) + batch_size - 1) // batch_size
 
@@ -251,7 +283,7 @@ def _batch_download(tickers: list[str], period: str, batch_size: int = DOWNLOAD_
         task = progress.add_task("Downloading price data...", total=total_batches)
 
         for i in range(0, len(tickers), batch_size):
-            batch = tickers[i : i + batch_size]
+            batch = tickers[i: i + batch_size]
             try:
                 raw = yf.download(
                     batch,
@@ -264,16 +296,12 @@ def _batch_download(tickers: list[str], period: str, batch_size: int = DOWNLOAD_
                 if raw.empty:
                     progress.advance(task)
                     continue
-
-                # yfinance returns MultiIndex when multiple tickers
                 if isinstance(raw.columns, pd.MultiIndex):
                     close = raw["Close"]
                     volume = raw["Volume"]
                 else:
-                    # Single ticker
                     close = raw[["Close"]].rename(columns={"Close": batch[0]})
                     volume = raw[["Volume"]].rename(columns={"Volume": batch[0]})
-
                 frames.append((close, volume))
             except Exception as e:
                 logger.warning(f"Batch {i // batch_size + 1} failed: {e}")
@@ -633,7 +661,17 @@ def main():
     parser.add_argument("--date", default=datetime.now().strftime("%Y-%m-%d"), help="Analysis date YYYY-MM-DD (default: today)")
     parser.add_argument("--dry-run", action="store_true", help="Show plan without downloading prices")
     parser.add_argument("--run-analysis", action="store_true", help="Run nightly_analysis.py on results immediately after screening")
+    parser.add_argument("--print", dest="print_file", metavar="FILE", help="Print an existing screener JSON report as a table and exit")
     args = parser.parse_args()
+
+    if args.print_file:
+        import json as _json
+        with open(args.print_file) as _f:
+            _data = _json.load(_f)
+        _df = pd.DataFrame(_data["candidates"])
+        _df.index = range(len(_df))
+        _print_results_table(_df)
+        sys.exit(0)
 
     result = screen(
         top_n=args.top,

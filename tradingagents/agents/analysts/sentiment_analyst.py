@@ -41,6 +41,7 @@ from tradingagents.agents.utils.structured import (
 )
 from tradingagents.dataflows.reddit import fetch_reddit_posts
 from tradingagents.dataflows.stocktwits import fetch_stocktwits_messages
+from tradingagents.dataflows.google_news import fetch_google_news, fetch_seeking_alpha
 
 
 def _seven_days_back(trade_date: str) -> str:
@@ -63,12 +64,14 @@ def create_sentiment_analyst(llm):
         start_date = _seven_days_back(end_date)
         instrument_context = get_instrument_context_from_state(state)
 
-        # Pre-fetch all three sources. Each fetcher degrades gracefully and
-        # returns a string (no exceptions surface from here), so the LLM
-        # always sees something — either real data or a clear placeholder.
+        # Pre-fetch all sources. Each fetcher degrades gracefully and returns
+        # a string (no exceptions surface from here), so the LLM always sees
+        # something — either real data or a clear placeholder.
         news_block = get_news.func(ticker, start_date, end_date)
         stocktwits_block = fetch_stocktwits_messages(ticker, limit=30)
         reddit_block = fetch_reddit_posts(ticker)
+        google_news_block = fetch_google_news(ticker, max_items=10)
+        seeking_alpha_block = fetch_seeking_alpha(ticker, max_items=5)
 
         system_message = _build_system_message(
             ticker=ticker,
@@ -77,6 +80,8 @@ def create_sentiment_analyst(llm):
             news_block=news_block,
             stocktwits_block=stocktwits_block,
             reddit_block=reddit_block,
+            google_news_block=google_news_block,
+            seeking_alpha_block=seeking_alpha_block,
         )
 
         prompt = ChatPromptTemplate.from_messages(
@@ -126,9 +131,11 @@ def _build_system_message(
     news_block: str,
     stocktwits_block: str,
     reddit_block: str,
+    google_news_block: str = "",
+    seeking_alpha_block: str = "",
 ) -> str:
     """Assemble the sentiment-analyst system message with structured data blocks."""
-    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on three complementary data sources that have already been collected for you.
+    return f"""You are a financial market sentiment analyst. Your task is to produce a comprehensive sentiment report for {ticker} covering the period from {start_date} to {end_date}, drawing on five complementary data sources that have already been collected for you.
 
 ## Data sources (pre-fetched, in this prompt)
 
@@ -138,6 +145,20 @@ Institutional framing. Fact-driven, slower-moving signal.
 <start_of_news>
 {news_block}
 <end_of_news>
+
+### Google News — broad multi-source coverage, past 7 days
+Aggregates Bloomberg, Reuters, CNBC, WSJ, FT and other major outlets. Wider institutional coverage than Yahoo Finance alone.
+
+<start_of_google_news>
+{google_news_block}
+<end_of_google_news>
+
+### Seeking Alpha — in-depth analyst articles and community analysis
+Deep-dive articles with bull/bear theses, earnings analysis, and sector comparisons. More analytical depth than news headlines.
+
+<start_of_seeking_alpha>
+{seeking_alpha_block}
+<end_of_seeking_alpha>
 
 ### StockTwits messages — retail-trader social platform indexed by cashtag
 Fast-moving signal. Each message carries a user-labeled sentiment tag (Bullish / Bearish / no-label) plus the message body.
@@ -157,19 +178,23 @@ Community discussion. Engagement signal via upvote score and comment count. Subr
 
 1. **Read the StockTwits Bullish/Bearish ratio as a leading retail-sentiment signal.** A 70/30 bullish/bearish split is moderately bullish; ≥90/10 may indicate over-extension and contrarian risk; 50/50 is uncertainty. Sample size matters — base rates on the actual message count, not percentages alone.
 
-2. **Look for cross-source divergences.** If news framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal — it can mean retail is leaning into a thesis the news flow hasn't caught up to (or vice versa, that retail is chasing while institutions are cautious).
+2. **Look for cross-source divergences.** If Google News / Yahoo Finance framing is bearish but StockTwits is overwhelmingly bullish, that mismatch is itself a signal. If Seeking Alpha analysts are constructive but Reddit is dismissive, the more analytical source usually carries more weight.
 
 3. **Weight Reddit posts by engagement.** A 400-upvote / 200-comment thread reflects community attention; a 3-upvote post is noise. Read the body excerpts for context — the title alone often misleads.
 
-4. **Distinguish opinion from event.** A news headline ("Nvidia announces $500M Corning deal") is an event; a StockTwits post ("buying NVDA, this is going to moon") is opinion. Both are inputs but should be weighted differently in your conclusions.
+4. **Use Google News and Yahoo Finance together for institutional breadth.** Google News often surfaces articles from Bloomberg, Reuters, CNBC, and FT that Yahoo Finance misses. Check for corroboration across both.
 
-5. **Identify recurring narrative themes.** What topic keeps coming up across sources? That's the dominant narrative driving current sentiment.
+5. **Use Seeking Alpha for thesis depth.** SA articles often contain detailed bull/bear theses, management commentary, and valuation analysis that headlines don't capture. Weight them accordingly.
 
-6. **Be honest about data limits.** If StockTwits returned only a handful of messages, or one or more sources returned an "<unavailable>" placeholder, the sentiment read is less robust — flag this explicitly in the `confidence` field and the narrative. If the sources are silent on a given subreddit, say so.
+6. **Distinguish opinion from event.** A news headline is an event; a StockTwits post is opinion. Both are inputs but should be weighted differently in your conclusions.
 
-7. **Identify catalysts and risks** that emerge across sources — news of upcoming earnings, product launches, competitive threats, macro headlines, etc.
+7. **Identify recurring narrative themes.** What topic keeps coming up across all five sources? That's the dominant narrative driving current sentiment.
 
-8. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
+8. **Be honest about data limits.** If one or more sources returned a placeholder, the sentiment read is less robust — flag this in the `confidence` field. If Reddit is 429-rate-limited but Google News and SA are strong, confidence can still be medium.
+
+9. **Identify catalysts and risks** that emerge across sources — earnings, product launches, competitive threats, macro headlines, regulatory news.
+
+10. **Past sentiment is not predictive.** Frame your conclusions as signal for the trader to weigh alongside fundamentals and technicals, not as a price call.
 
 ## Output fields
 

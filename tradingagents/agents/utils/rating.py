@@ -26,13 +26,27 @@ _RATING_SET = {r.lower() for r in RATINGS_5_TIER}
 # bold wrappers and either a colon or hyphen separator.
 _RATING_LABEL_RE = re.compile(r"rating.*?[:\-][\s*]*(\w+)", re.IGNORECASE)
 
+# Matches a rating word in a structured recommendation context:
+# - Bold markdown: **Buy**, **Hold**, etc.
+# - After recommendation keywords: "recommend: Buy", "stance: Hold", "decision: Sell"
+# - Standalone bullet/heading: "- Hold" or "## Hold"
+_RATING_CONTEXT_RE = re.compile(
+    r"(?:\*\*(\w+)\*\*"
+    r"|(?:recommend(?:ation)?|stance|decision|conclusion|action)\s*[:\-]\s*\**(\w+)\**"
+    r"|^[-#\s]*(\w+)\s*$)",
+    re.IGNORECASE | re.MULTILINE,
+)
+
 
 def parse_rating(text: str, default: str = "Hold") -> str:
     """Heuristically extract a 5-tier rating from prose text.
 
-    Two-pass strategy:
+    Three-pass strategy:
     1. Look for an explicit "Rating: X" label (tolerant of markdown bold).
-    2. Fall back to the first 5-tier rating word found anywhere in the text.
+    2. Look for a rating word in a structured context (bold, after recommendation
+       keywords, or as a standalone heading/bullet) — avoids picking up rating
+       words mentioned in passing prose (e.g. "an outright buy or sell").
+    3. Fall back to default.
 
     Returns a Title-cased rating string, or ``default`` if no rating word appears.
     """
@@ -41,10 +55,9 @@ def parse_rating(text: str, default: str = "Hold") -> str:
         if m and m.group(1).lower() in _RATING_SET:
             return m.group(1).capitalize()
 
-    for line in text.splitlines():
-        for word in line.lower().split():
-            clean = word.strip("*:.,")
-            if clean in _RATING_SET:
-                return clean.capitalize()
+    for m in _RATING_CONTEXT_RE.finditer(text):
+        word = next((g for g in m.groups() if g), None)
+        if word and word.lower() in _RATING_SET:
+            return word.capitalize()
 
     return default

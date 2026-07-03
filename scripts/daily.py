@@ -11,10 +11,11 @@ Menu
 Usage
 -----
     python scripts/daily.py                    # interactive menu
-    python scripts/daily.py --run              # non-interactive: full pipeline (sp500, top 20)
+    python scripts/daily.py --run              # non-interactive: full pipeline (full+sp500+nasdaq100, top 20 each)
     python scripts/daily.py --run --universe full --top 30
+    python scripts/daily.py --run --universe sp500,nasdaq100
     python scripts/daily.py --run --skip-sync  # skip Moomoo sync step
-    python scripts/daily.py --pipeline         # interactive full pipeline (prompts for universe)
+    python scripts/daily.py --pipeline         # interactive full pipeline (prompts for universe(s))
     python scripts/daily.py --analyse          # non-interactive: analyse only
     python scripts/daily.py --fills            # non-interactive: record fills
     python scripts/daily.py --date 2026-06-04
@@ -37,6 +38,8 @@ import questionary
 load_dotenv()
 
 sys.path.insert(0, str(Path(__file__).parent.parent))
+
+from tradingagents.default_config import DEFAULT_CONFIG
 
 console = Console()
 
@@ -162,61 +165,84 @@ def _sync_moomoo(host: str, port: int):
     _moomoo_run(host=host, port=port, dry_run=False, yes=True, paper=False)
 
 
-def _run_screener(date: str, universe: str, top_n: int) -> list[str] | None:
-    """Non-interactive screener run."""
-    from scripts.pre_screener import screen
-    _log(f"Screening universe=[cyan]{universe}[/cyan]  top={top_n} …")
-    result = screen(top_n=top_n, universe_source=universe, date=date)
-    if not result.get("success"):
-        console.print("[red]Screener failed — will fall back to portfolio tickers.[/red]")
+def _build_secondary_config(profile: dict) -> dict | None:
+    """Build config for the secondary model if configured in profile, else None."""
+    secondary_model = profile.get("secondary_deep_think_llm", "").strip()
+    if not secondary_model:
         return None
-    tickers = result.get("candidates", [])
-    _log(f"Screener selected [green]{len(tickers)}[/green] candidates")
-    return tickers
+    config = DEFAULT_CONFIG.copy()
+    config["llm_provider"] = profile.get("secondary_llm_provider", profile.get("llm_provider", config["llm_provider"]))
+    config["deep_think_llm"] = secondary_model
+    config["quick_think_llm"] = profile.get("quick_think_llm", config["quick_think_llm"])
+    return config
 
 
-def _run_screener_interactive(date: str) -> list[str] | None:
-    """Prompt for universe / top-N, then run screener."""
-    from scripts.pre_screener import screen
+def _run_unified_scan(
+    date: str,
+    universes: list[str],
+    top_n: int,
+    held_tickers: set[str],
+    force_refresh: bool = False,
+) -> dict | None:
+    """Run (or reuse cached) unified scan across all requested universes + held tickers."""
+    from scripts.market_scan import run_unified_scan
+    from scripts.nightly_analysis import _build_config
+    _log(f"Scanning universes=[cyan]{', '.join(universes)}[/cyan]  top={top_n} each …")
+    profile = json.loads(PROFILE_PATH.read_text())
+    primary_config = _build_config(profile)
+    secondary_config = _build_secondary_config(profile)
+    if secondary_config:
+        _log(f"Dual model: primary=[cyan]{primary_config.get('deep_think_llm')}[/cyan]  secondary=[cyan]{secondary_config['deep_think_llm']}[/cyan]")
+    else:
+        _log(f"Model: [cyan]{primary_config.get('deep_think_llm')}[/cyan]")
+    scan = run_unified_scan(
+        date=date,
+        universes=universes,
+        top_n=top_n,
+        extra_tickers={"held": sorted(held_tickers)} if held_tickers else None,
+        config=primary_config,
+        secondary_config=secondary_config,
+        force_refresh=force_refresh,
+    )
+    n_candidates = len(scan["tags"])
+    _log(f"Unified scan covers [green]{n_candidates}[/green] ticker(s) across {len(universes)} universe(s)")
+    return scan
 
+
+def _run_unified_scan_interactive(date: str, held_tickers: set[str], force_refresh: bool = False) -> dict | None:
+    """Prompt for universes / top-N, then run the unified scan."""
     console.print()
-    universe = questionary.select(
-        "Which universe to scan?",
+    universes = questionary.checkbox(
+        "Which universe(s) to scan? (space to toggle, enter to confirm)",
         choices=[
-            questionary.Choice(label, value=src)
+            questionary.Choice(label, value=src, checked=True)
             for src, label in _UNIVERSE_LABELS.items()
+            if src in ("full", "sp500", "nasdaq100")
         ],
     ).ask()
-    if universe is None:
+    if not universes:
         return None
 
     top_raw = questionary.text(
-        "How many top candidates to keep?",
+        "How many top candidates to keep per universe?",
         default="20",
         validate=lambda v: (v.isdigit() and int(v) >= 1) or "Enter a positive number",
     ).ask()
     if top_raw is None:
         return None
 
-    if universe == "full":
+    if "full" in universes:
         console.print("[yellow]Scanning full US market — this takes a few minutes.[/yellow]")
 
-    _log(f"Screening universe=[cyan]{universe}[/cyan]  top={top_raw} …")
-    result = screen(top_n=int(top_raw), universe_source=universe, date=date)
-    if not result.get("success"):
-        console.print("[red]Screener failed — will fall back to portfolio tickers.[/red]")
-        return None
-    tickers = result.get("candidates", [])
-    _log(f"Screener selected [green]{len(tickers)}[/green] candidates")
-    return tickers
+    return _run_unified_scan(date, universes, int(top_raw), held_tickers, force_refresh=force_refresh)
 
 
-def _run_analysis(tickers: list[str], date: str):
+def _run_analysis(tickers: list[str], date: str, precomputed_scan: dict | None = None):
     """Run nightly_analysis with the given ticker list."""
     from scripts.nightly_analysis import run as run_analysis
     preview = ", ".join(tickers[:8]) + (f" … +{len(tickers) - 8} more" if len(tickers) > 8 else "")
     _log(f"Analysing [cyan]{len(tickers)}[/cyan] ticker(s): {preview}")
-    run_analysis(date=date, ticker_file=None, tickers_override=tickers)
+    run_analysis(date=date, ticker_file=None, tickers_override=tickers, precomputed_scan=precomputed_scan)
 
 
 def _run_fills():
@@ -232,17 +258,20 @@ def _run_fills():
 def mode_full_pipeline(
     date: str,
     non_interactive: bool = False,
-    universe: str = "full",
+    universes: list[str] | None = None,
     top_n: int = 20,
     skip_sync: bool = False,
     moomoo_host: str = "127.0.0.1",
     moomoo_port: int = 11111,
     force: bool = False,
+    force_refresh: bool = False,
 ):
-    if not force and _us_market_is_open():
+    universes = universes or ["full", "sp500", "nasdaq100"]
+    today = datetime.now().strftime("%Y-%m-%d")
+    if not force and date == today and _us_market_is_open():
         _warn_market_open(non_interactive)
 
-    total_steps = (2 if skip_sync else 3)
+    total_steps = (3 if skip_sync else 4)
     step = 0
     pipeline_start = time.monotonic()
 
@@ -265,31 +294,36 @@ def mode_full_pipeline(
     portfolio = json.loads(PORTFOLIO_CONFIG_PATH.read_text())
     held_tickers = set(portfolio.get("holdings", {}).keys())
 
-    # Step 2: Screener
+    # Step 2: Unified scan (all requested universes, shared with the channel broadcast)
     step += 1
     with _step("Market screener", step, total_steps):
         if non_interactive:
-            tickers = _run_screener(date, universe, top_n)
+            scan = _run_unified_scan(date, universes, top_n, held_tickers, force_refresh=force_refresh)
         else:
-            tickers = _run_screener_interactive(date)
+            scan = _run_unified_scan_interactive(date, held_tickers, force_refresh=force_refresh)
 
-    if not tickers:
+    if not scan or not scan.get("tags"):
         tickers = portfolio.get("tickers", [])
         if not tickers:
             console.print("[red]No tickers available. Aborting.[/red]")
             return
         _log(f"Falling back to {len(tickers)} tickers from portfolio config.")
-
-    # Always include held positions so they get a fresh signal
-    extra = held_tickers - set(tickers)
-    if extra:
-        _log(f"Adding {len(extra)} held ticker(s) not in screener: {', '.join(sorted(extra))}")
-    tickers = sorted(set(tickers) | held_tickers)
+        tickers = sorted(set(tickers) | held_tickers)
+        precomputed_scan = None
+    else:
+        tickers = sorted(set(scan["tags"].keys()) | held_tickers)
+        precomputed_scan = scan["results"]
 
     # Step 3: LLM analysis + order staging
     step += 1
     with _step("LLM analysis & order staging", step, total_steps):
-        _run_analysis(tickers, date)
+        _run_analysis(tickers, date, precomputed_scan=precomputed_scan)
+
+    # Step 4: Channel broadcast (reuses cached scan — no extra LLM cost)
+    step += 1
+    with _step("Channel broadcast", step, total_steps):
+        from scripts.broadcast_top10 import run as run_broadcast
+        run_broadcast(date=date, universes=universes, top_n=top_n)
 
     # Final summary
     total_elapsed = time.monotonic() - pipeline_start
@@ -327,6 +361,112 @@ def mode_record_fills():
     console.print()
     console.print(Rule("[bold cyan]Record Fills — Update Holdings[/bold cyan]"))
     _run_fills()
+
+
+def mode_sync(moomoo_host: str = "127.0.0.1", moomoo_port: int = 11111):
+    """Step 1 only — sync Moomoo holdings into portfolio_config.json."""
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold cyan]TradingAgents — Step 1: Moomoo Sync[/bold cyan]",
+            border_style="cyan",
+        )
+    )
+    _require_profile()
+    with _step("Sync Moomoo holdings", 1, 1):
+        _sync_moomoo(moomoo_host, moomoo_port)
+    console.print("[bold green]Sync complete.[/bold green]")
+    console.print("[dim]Next: python scripts/daily.py --scan[/dim]")
+    console.print()
+
+
+def mode_scan(
+    date: str,
+    universes: list[str] | None = None,
+    top_n: int = 20,
+    force_refresh: bool = False,
+):
+    """Step 2 only — run unified market scan and save to cache.
+    Resumes automatically from any prior checkpoint for this date."""
+    universes = universes or ["full", "sp500", "nasdaq100"]
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold cyan]TradingAgents — Step 2: Market Scan[/bold cyan]\n"
+            f"[dim]Date: {date}  Universes: {', '.join(universes)}  Top: {top_n}[/dim]",
+            border_style="cyan",
+        )
+    )
+    _require_profile()
+    portfolio = json.loads(PORTFOLIO_CONFIG_PATH.read_text())
+    held_tickers = set(portfolio.get("holdings", {}).keys())
+
+    with _step("Unified market scan", 1, 1):
+        scan = _run_unified_scan(date, universes, top_n, held_tickers, force_refresh=force_refresh)
+
+    n_results = len(scan.get("results", {})) if scan else 0
+    n_total = len(scan.get("tags", {})) if scan else 0
+    console.print(f"[bold green]Scan complete:[/bold green] {n_results}/{n_total} tickers analyzed")
+    console.print(f"[dim]Cache: {_cache_path(date)}[/dim]")
+    console.print("[dim]Next: python scripts/daily.py --advise[/dim]")
+    console.print()
+
+
+def mode_advise(date: str):
+    """Step 3 only — run personal portfolio advisor using cached scan.
+    Requires a prior --scan run for this date."""
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold cyan]TradingAgents — Step 3: Personal Advisor[/bold cyan]\n"
+            f"[dim]Date: {date}[/dim]",
+            border_style="cyan",
+        )
+    )
+    _require_profile()
+    from scripts.market_scan import _cache_path, _load_cache
+    cache = _load_cache(date)
+    if not cache or not cache.get("results"):
+        console.print(
+            f"[bold red]No cached scan found for {date}.[/bold red] "
+            "Run [bold]python scripts/daily.py --scan[/bold] first."
+        )
+        return
+
+    portfolio = json.loads(PORTFOLIO_CONFIG_PATH.read_text())
+    held_tickers = set(portfolio.get("holdings", {}).keys())
+    tickers = sorted(set(cache["tags"].keys()) | held_tickers)
+    precomputed_scan = cache["results"]
+
+    n_results = len(precomputed_scan)
+    console.print(f"[dim]Using cached scan: {n_results} rated ticker(s)[/dim]")
+
+    with _step("Personal advisor & order staging", 1, 1):
+        _run_analysis(tickers, date, precomputed_scan=precomputed_scan)
+
+    console.print("[dim]Next: review orders, then python scripts/daily.py --fills[/dim]")
+    console.print()
+
+
+def _cache_path(date: str):
+    from pathlib import Path
+    return Path("reports") / f"UNIFIED_SCAN_{date}.json"
+
+
+def mode_broadcast(date: str, universes: list[str] | None = None, top_n: int = 20):
+    """Step 4 only — run channel broadcast using cached scan."""
+    universes = universes or ["full", "sp500", "nasdaq100"]
+    console.print()
+    console.print(
+        Panel.fit(
+            "[bold cyan]TradingAgents — Step 4: Channel Broadcast[/bold cyan]\n"
+            f"[dim]Date: {date}[/dim]",
+            border_style="cyan",
+        )
+    )
+    from scripts.broadcast_top10 import run as run_broadcast
+    with _step("Channel broadcast", 1, 1):
+        run_broadcast(date=date, universes=universes, top_n=top_n)
 
 
 # ---------------------------------------------------------------------------
@@ -405,14 +545,36 @@ def main():
         action="store_true",
         help="Non-interactive: record broker fills",
     )
+    group.add_argument(
+        "--sync",
+        action="store_true",
+        help="Step 1 only: sync Moomoo holdings into portfolio_config.json",
+    )
+    group.add_argument(
+        "--scan",
+        action="store_true",
+        help="Step 2 only: run unified market scan and save to cache (resumes from checkpoint if interrupted)",
+    )
+    group.add_argument(
+        "--advise",
+        action="store_true",
+        help="Step 3 only: run personal portfolio advisor using cached scan from --scan",
+    )
+    group.add_argument(
+        "--broadcast",
+        action="store_true",
+        help="Step 4 only: run channel broadcast using cached scan (reuses --scan results, no extra LLM cost)",
+    )
 
     screener = parser.add_argument_group("screener options (--run only)")
     screener.add_argument(
         "--universe",
-        default="full",
-        choices=list(_UNIVERSE_LABELS.keys()),
+        default="full,sp500,nasdaq100",
         metavar="UNIVERSE",
-        help="Universe to screen: full (default), sp500, nasdaq100, sp500+nasdaq100",
+        help=(
+            "Comma-separated universe(s) to scan in one unified pass "
+            "(default: full,sp500,nasdaq100). Options: full, sp500, nasdaq100."
+        ),
     )
     screener.add_argument(
         "--top",
@@ -435,6 +597,14 @@ def main():
         action="store_true",
         help="Skip the market-hours safety check (orders generated during market hours should NOT be executed)",
     )
+    parser.add_argument(
+        "--force-refresh",
+        action="store_true",
+        help=(
+            "Ignore any cached unified scan for this date and re-run the LLM analysis "
+            "from scratch (e.g. after changing TRADINGAGENTS_DEEP_THINK_LLM to compare models)"
+        ),
+    )
 
     args = parser.parse_args()
     _require_profile()
@@ -443,12 +613,13 @@ def main():
         mode_full_pipeline(
             date=args.date,
             non_interactive=True,
-            universe=args.universe,
+            universes=[u.strip() for u in args.universe.split(",") if u.strip()],
             top_n=args.top,
             skip_sync=args.skip_sync,
             moomoo_host=args.moomoo_host,
             moomoo_port=args.moomoo_port,
             force=args.force,
+            force_refresh=args.force_refresh,
         )
     elif args.pipeline:
         mode_full_pipeline(
@@ -458,11 +629,29 @@ def main():
             moomoo_host=args.moomoo_host,
             moomoo_port=args.moomoo_port,
             force=args.force,
+            force_refresh=args.force_refresh,
         )
     elif args.analyse:
         mode_analyse_only(args.date)
     elif args.fills:
         mode_record_fills()
+    elif args.sync:
+        mode_sync(moomoo_host=args.moomoo_host, moomoo_port=args.moomoo_port)
+    elif args.scan:
+        mode_scan(
+            date=args.date,
+            universes=[u.strip() for u in args.universe.split(",") if u.strip()],
+            top_n=args.top,
+            force_refresh=args.force_refresh,
+        )
+    elif args.advise:
+        mode_advise(date=args.date)
+    elif args.broadcast:
+        mode_broadcast(
+            date=args.date,
+            universes=[u.strip() for u in args.universe.split(",") if u.strip()],
+            top_n=args.top,
+        )
     else:
         _interactive_menu(args.date)
 

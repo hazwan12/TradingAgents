@@ -68,6 +68,18 @@ _token_lock = threading.Lock()
 
 DEFAULT_SUBREDDITS = ("wallstreetbets", "stocks", "investing")
 
+# RSS rate limiter — shared across threads. Without OAuth, the public RSS feed
+# is gated process-wide regardless of which ticker/subreddit is being fetched,
+# so WatchlistScanner running many tickers concurrently (one thread per
+# ticker) can trip 429s even though each thread paces its own requests —
+# every thread races the same Reddit-side limit independently. This lock
+# enforces one RSS request at a time, at least _RSS_MIN_INTERVAL apart,
+# process-wide.
+_rss_lock = threading.Lock()
+_rss_last_request_at = 0.0
+_RSS_MIN_INTERVAL = 1.5  # seconds between any two RSS requests, across all threads
+_RSS_MAX_RETRIES = 2
+
 
 # ---------------------------------------------------------------------------
 # OAuth2 token management
@@ -196,6 +208,17 @@ def _fetch_subreddit_oauth(
         return []
 
 
+def _throttle_rss():
+    """Block until at least _RSS_MIN_INTERVAL has passed since the last RSS
+    request from any thread."""
+    global _rss_last_request_at
+    with _rss_lock:
+        wait = _RSS_MIN_INTERVAL - (time.time() - _rss_last_request_at)
+        if wait > 0:
+            time.sleep(wait)
+        _rss_last_request_at = time.time()
+
+
 def _fetch_subreddit_rss(
     ticker: str,
     sub: str,
@@ -205,11 +228,29 @@ def _fetch_subreddit_rss(
     """Fallback: public Atom/RSS feed — no scores or comment counts."""
     url = _RSS.format(sub=sub, qs=_search_qs(ticker, limit))
     req = Request(url, headers={"User-Agent": _UA})
-    try:
-        with urlopen(req, timeout=timeout) as resp:
-            root = ET.fromstring(resp.read())
-    except (HTTPError, URLError, TimeoutError, ET.ParseError) as exc:
-        logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
+
+    for attempt in range(_RSS_MAX_RETRIES + 1):
+        _throttle_rss()
+        try:
+            with urlopen(req, timeout=timeout) as resp:
+                root = ET.fromstring(resp.read())
+            break
+        except HTTPError as exc:
+            if exc.code == 429 and attempt < _RSS_MAX_RETRIES:
+                retry_after = exc.headers.get("Retry-After") if exc.headers else None
+                backoff = float(retry_after) if retry_after else 2.0 * (attempt + 1)
+                logger.debug(
+                    "Reddit RSS 429 for r/%s · %s — retrying in %.1fs (attempt %d/%d)",
+                    sub, ticker, backoff, attempt + 1, _RSS_MAX_RETRIES,
+                )
+                time.sleep(backoff)
+                continue
+            logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
+            return []
+        except (URLError, TimeoutError, ET.ParseError) as exc:
+            logger.warning("Reddit RSS fetch failed for r/%s · %s: %s", sub, ticker, exc)
+            return []
+    else:
         return []
 
     posts = []

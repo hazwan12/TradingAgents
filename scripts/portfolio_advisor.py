@@ -57,12 +57,20 @@ class PortfolioAdvisor:
         self.results_dir = Path(self.config.get("results_dir", "reports"))
         self.results_dir.mkdir(exist_ok=True)
 
-    def advise(self, tickers: List[str], date: str) -> Dict[str, Any]:
+    def advise(
+        self,
+        tickers: List[str],
+        date: str,
+        precomputed_scan: Optional[Dict[str, dict]] = None,
+    ) -> Dict[str, Any]:
         """Generate buy/sell recommendations for tickers.
 
         Args:
             tickers: List of tickers to analyze (e.g., ["NVDA", "AAPL"])
             date: Analysis date in YYYY-MM-DD format
+            precomputed_scan: optional {ticker: {rating, action, executive_summary, ...}}
+                map (e.g. from scripts/market_scan.py). When given, skips running the
+                WatchlistScanner and reuses these ratings instead.
 
         Returns:
             Dict with keys:
@@ -77,10 +85,16 @@ class PortfolioAdvisor:
         """
         logger.info(f"Generating portfolio advice for {len(tickers)} tickers on {date}")
 
-        # Step 1: Run watchlist scanner
-        logger.info("Step 1: Running watchlist analysis...")
-        scan_result = self.scanner.scan(tickers, date)
-        if not scan_result.get("results"):
+        # Step 1: Run watchlist scanner (or reuse a precomputed scan)
+        if precomputed_scan is not None:
+            logger.info("Step 1: Using precomputed scan (skipping WatchlistScanner)...")
+            scan_results = [precomputed_scan[t] for t in tickers if t in precomputed_scan]
+        else:
+            logger.info("Step 1: Running watchlist analysis...")
+            scan_result = self.scanner.scan(tickers, date)
+            scan_results = scan_result.get("results", [])
+
+        if not scan_results:
             logger.error("Watchlist scan failed or returned no results")
             return {"success": False, "error": "Watchlist scan failed"}
 
@@ -106,7 +120,7 @@ class PortfolioAdvisor:
         total_buy_power = 0.0
         total_sell_proceeds = 0.0
 
-        for scan_result_item in scan_result["results"]:
+        for scan_result_item in scan_results:
             ticker = scan_result_item["ticker"]
             action = scan_result_item["action"]
 
@@ -117,9 +131,16 @@ class PortfolioAdvisor:
 
             current_units = self.holdings.get(ticker, 0.0)
 
-            # Parse position sizing from scan result
-            position_sizing_text = scan_result_item.get("executive_summary", "")
-            target_pct = parse_position_sizing(position_sizing_text)
+            # Gate target allocation on the LLM's action signal
+            if action == "Sell":
+                target_pct = 0.0  # close/don't open position
+            elif action == "Hold":
+                continue  # no trade needed
+            elif action == "Underweight" and current_units == 0:
+                continue  # don't open a position we'd immediately underweight
+            else:
+                position_sizing_text = scan_result_item.get("executive_summary", "")
+                target_pct = parse_position_sizing(position_sizing_text)
 
             # Calculate units to trade
             units_to_trade, dollar_amount = calculate_units_to_trade(

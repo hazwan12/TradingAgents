@@ -30,6 +30,7 @@ load_dotenv()
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 from scripts.portfolio_advisor import PortfolioAdvisor
+from scripts.notifier import send_telegram, format_orders_message, format_failure_message
 from tradingagents.default_config import DEFAULT_CONFIG
 
 logger = logging.getLogger(__name__)
@@ -99,18 +100,32 @@ def _recommendations_to_orders(
         direction = "buy" if rec["units_to_trade"] > 0 else "sell"
         estimated_price = rec["current_price"]
         limit_price = _calc_limit_price(estimated_price, direction, buffer_pct)
+        units = abs(rec["units_to_trade"])
+
+        # Holding power: max drawdown exposure = distance from entry to stop-loss × units
+        stop_loss = rec.get("stop_loss")
+        if stop_loss and direction == "buy" and estimated_price > stop_loss:
+            max_drawdown = round((estimated_price - stop_loss) * units, 2)
+            drawdown_pct = round((estimated_price - stop_loss) / estimated_price * 100, 1)
+        else:
+            max_drawdown = None
+            drawdown_pct = None
+
         orders.append(
             {
                 "id": str(uuid.uuid4()),
                 "ticker": rec["ticker"],
                 "action": rec["action"],
                 "rating": rec.get("rating", ""),
-                "units": abs(rec["units_to_trade"]),
+                "units": units,
                 "direction": direction,
                 "estimated_price": estimated_price,
                 "limit_price": limit_price,
                 "limit_price_buffer_pct": buffer_pct,
-                "estimated_total": round(limit_price * abs(rec["units_to_trade"]), 2),
+                "estimated_total": round(limit_price * units, 2),
+                "stop_loss": stop_loss,
+                "max_drawdown_exposure": max_drawdown,
+                "drawdown_pct": drawdown_pct,
                 "order_type": "limit",
                 "status": "pending",
                 "created_at": datetime.now().isoformat(),
@@ -193,6 +208,7 @@ def run(
     dry_run: bool = False,
     ticker_file: str | None = None,
     tickers_override: list[str] | None = None,
+    precomputed_scan: dict | None = None,
 ):
     console.print()
     console.print(
@@ -241,10 +257,12 @@ def run(
         config=config,
     )
 
-    result = advisor.advise(tickers, date)
+    result = advisor.advise(tickers, date, precomputed_scan=precomputed_scan)
 
     if not result.get("success"):
-        console.print(f"[bold red]Analysis failed:[/bold red] {result.get('error', 'unknown error')}")
+        error = result.get("error", "unknown error")
+        console.print(f"[bold red]Analysis failed:[/bold red] {error}")
+        send_telegram(format_failure_message(date, error))
         sys.exit(1)
 
     console.print()
@@ -273,6 +291,23 @@ def run(
     console.print(f"  [bold]python scripts/update_holdings.py[/bold]")
     console.print()
 
+    # Enrich orders with bull/bear/verdict from precomputed scan if available
+    if precomputed_scan:
+        for order in orders_doc["orders"]:
+            t = order["ticker"]
+            scan_entry = precomputed_scan.get(t, {})
+            order["bull_thesis"] = scan_entry.get("bull_thesis", "")
+            order["bear_concern"] = scan_entry.get("bear_concern", "")
+            order["judge_verdict"] = scan_entry.get("judge_verdict", "")
+            order["executive_summary"] = scan_entry.get("executive_summary", "")
+            order["secondary_rating"] = scan_entry.get("secondary_rating", "")
+            order["secondary_model"] = scan_entry.get("secondary_model", "")
+            order["primary_model"] = scan_entry.get("primary_model", "")
+
+    if send_telegram(format_orders_message(date, orders_doc, result)):
+        console.print("[dim]Telegram notification sent.[/dim]")
+    console.print()
+
 
 def main():
     parser = argparse.ArgumentParser(description="Run nightly portfolio analysis")
@@ -291,7 +326,19 @@ def main():
         metavar="FILE",
         help="JSON (from pre_screener.py) or .txt (one ticker per line) to use instead of portfolio config tickers",
     )
+    parser.add_argument(
+        "--print",
+        dest="print_file",
+        metavar="FILE",
+        help="Print an existing orders JSON as a table and exit",
+    )
     args = parser.parse_args()
+
+    if args.print_file:
+        orders_doc = json.loads(Path(args.print_file).read_text())
+        _print_orders_table(orders_doc.get("orders", []))
+        sys.exit(0)
+
     run(args.date, dry_run=args.dry_run, ticker_file=args.ticker_file)
 
 

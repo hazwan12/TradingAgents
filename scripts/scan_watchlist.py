@@ -16,6 +16,7 @@ from dotenv import load_dotenv
 from tradingagents.graph.trading_graph import TradingAgentsGraph
 from tradingagents.default_config import DEFAULT_CONFIG
 from tradingagents.agents.utils.rating import parse_rating
+from tradingagents.agents.utils.agent_utils import resolve_instrument_identity
 
 
 logger = logging.getLogger(__name__)
@@ -97,6 +98,46 @@ class WatchlistScanner:
             "elapsed_seconds": elapsed.total_seconds(),
         }
 
+    @staticmethod
+    def _last_message_text(history: list, max_chars: int = 200) -> str:
+        """Extract the most substantive AI message from a LangChain message history.
+
+        Takes the longest message with real content rather than the last one,
+        since trailing messages are often one-character acknowledgments (., ?, !).
+        """
+        if not history:
+            return ""
+
+        def _extract(msg) -> str:
+            if isinstance(msg, str):
+                return msg
+            if hasattr(msg, "content"):
+                return msg.content if isinstance(msg.content, str) else ""
+            if hasattr(msg, "get"):
+                return msg.get("content", "")
+            return ""
+
+        # Find the longest substantive message (skip very short trailing acks)
+        best = ""
+        for msg in history:
+            text = _extract(msg)
+            if isinstance(text, str) and len(text) > len(best):
+                best = text
+
+        if not best:
+            return ""
+        return WatchlistScanner._clean_and_truncate(best, max_chars)
+
+    @staticmethod
+    def _clean_and_truncate(text: str, max_chars: int) -> str:
+        """Strip markdown, collapse whitespace, and truncate on a word boundary with '...'."""
+        text = re.sub(r"[\*_#`]{1,3}", "", text).strip()
+        text = " ".join(text.split())
+        if len(text) <= max_chars:
+            return text
+        truncated = text[:max_chars - 3].rsplit(" ", 1)[0]
+        return truncated + "..."
+
     def _analyze_ticker(self, ticker: str, date: str) -> Dict[str, Any]:
         """Analyze a single ticker.
 
@@ -131,18 +172,66 @@ class WatchlistScanner:
         price_target = self._extract_price(portfolio_text, "Price Target")
 
         # Extract executive summary from portfolio decision
-        summary = self._extract_section(portfolio_text, "Executive Summary")
+        summary = self._extract_section(portfolio_text, "Executive Summary", max_chars=300)
+
+        # Extract bull/bear debate reasoning and research manager verdict
+        debate = final_state.get("investment_debate_state") or {}
+        bull_thesis = self._last_message_text(debate.get("bull_history") or [], max_chars=200)
+        bear_concern = self._last_message_text(debate.get("bear_history") or [], max_chars=200)
+        full_judge_text = str(debate.get("judge_decision") or "")
+        full_judge_text = self._drop_if_wrong_company(ticker, full_judge_text)
+        judge_verdict = self._clean_and_truncate(full_judge_text, max_chars=200) if full_judge_text else ""
+
+        rating_str = rating.value if hasattr(rating, "value") else str(rating)
+
+        # _extract_action falls back to "Hold" when the regex doesn't match the
+        # model's output format. Recover the real signal from the rating field
+        # (parsed by a more robust multi-pass heuristic) so Buy/Sell ratings
+        # from the portfolio manager aren't silently swallowed.
+        if action == "Hold" and rating_str in ("Buy", "Overweight"):
+            action = "Buy"
+        elif action == "Hold" and rating_str in ("Sell", "Underweight"):
+            action = "Sell"
 
         return {
             "ticker": ticker,
-            "rating": rating.value if hasattr(rating, "value") else str(rating),
+            "rating": rating_str,
             "action": action,
             "entry_price": entry_price,
             "stop_loss": stop_loss,
             "price_target": price_target,
             "executive_summary": summary,
+            "bull_thesis": bull_thesis,
+            "bear_concern": bear_concern,
+            "judge_verdict": judge_verdict,
             "date": date,
         }
+
+    def _drop_if_wrong_company(self, ticker: str, text: str) -> str:
+        """Blank rationale text that hallucinates a different company (#PAYX/WISE bug).
+
+        The Research Manager occasionally names the wrong company in its free-text
+        judgment. resolve_instrument_identity gives a ground-truth company name to
+        check the text against before it reaches any downstream report/broadcast.
+        """
+        if not text:
+            return text
+        identity = resolve_instrument_identity(ticker)
+        company_name = identity.get("company_name", "")
+        text_lower = text.lower()
+        if ticker.upper() in text.upper():
+            return text
+        if company_name:
+            first_word = company_name.split()[0].lower()
+            if len(first_word) > 2 and first_word in text_lower:
+                return text
+            logger.warning(
+                "Dropping judge_verdict for %s — text doesn't mention %s or %s: %r",
+                ticker, ticker, company_name, text[:100],
+            )
+            return ""
+        # No ground-truth identity available — can't validate, keep text as-is.
+        return text
 
     def _extract_action(self, text: str) -> str:
         """Extract trader action (Buy/Hold/Sell) from markdown."""
@@ -154,14 +243,26 @@ class WatchlistScanner:
         return match.group(1) if match else "Hold"
 
     def _extract_price(self, text: str, label: str) -> Optional[float]:
-        """Extract a numeric price value from markdown (e.g., Entry Price: 225.00)."""
-        pattern = rf"\*\*{label}\*\*:\s*([\d.]+)"
-        match = re.search(pattern, text)
-        if match:
-            try:
-                return float(match.group(1))
-            except ValueError:
-                pass
+        """Extract a numeric price value from LLM output.
+
+        Handles several output styles:
+            **Entry Price**: $225.00
+            **Entry Price**: 225.00
+            Entry Price: $225
+            - entry price: 225.50
+        """
+        patterns = [
+            rf"\*\*{label}\*\*:\s*\$?([\d,.]+)",   # bold markdown, optional $
+            rf"{label}:\s*\$?([\d,.]+)",            # plain label, optional $
+            rf"{label.lower()}:\s*\$?([\d,.]+)",    # lowercase, optional $
+        ]
+        for pattern in patterns:
+            match = re.search(pattern, text, re.IGNORECASE)
+            if match:
+                try:
+                    return float(match.group(1).replace(",", ""))
+                except ValueError:
+                    pass
         return None
 
     def _extract_section(self, text: str, section: str, max_chars: int = 150) -> str:

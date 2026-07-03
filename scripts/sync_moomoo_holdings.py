@@ -138,7 +138,10 @@ def _fetch_cash(host: str, port: int, paper: bool) -> float | None:
         ret, data = ctx.accinfo_query(trd_env=trd_env)
         ctx.close()
         if ret == ft.RET_OK and not data.empty:
-            return float(data.iloc[0].get("cash", 0))
+            # `cash` is the account-total figure converted into the account's
+            # base currency (e.g. HKD), not USD — use `us_cash` since this
+            # framework trades and budgets in USD.
+            return float(data.iloc[0].get("us_cash", 0))
     except Exception:
         pass
     return None
